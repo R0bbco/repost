@@ -32,7 +32,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 # deno (нужен yt-dlp для YouTube) ставится рядом с python.exe — добавляем в PATH
 os.environ["PATH"] = os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", "")
 
-VERSION = "1.5"
+VERSION = "1.6"
 APP_FILES = ["repost_app.py", "README.md", "requirements.txt", "start.bat"]
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "RepostApp"
@@ -44,9 +44,9 @@ VK_VIDEO = "https://vkvideo.ru"
 YT_SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
              "https://www.googleapis.com/auth/youtube.readonly"]
 SOURCES = [("youtube", "YouTube"), ("tiktok", "TikTok"), ("vk", "ВКонтакте"),
-           ("reddit", "Reddit")]
+           ("reddit", "Reddit"), ("instagram", "Instagram")]
 # источники, которые добавляются только вручную (ссылкой или файлом), без поиска
-SOURCE_NAMES = dict(SOURCES) | {"instagram": "Instagram", "link": "Ссылка", "file": "Файл"}
+SOURCE_NAMES = dict(SOURCES) | {"link": "Ссылка", "file": "Файл"}
 VIDEO_EXT = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RepostApp/1.0"
 
@@ -139,11 +139,11 @@ class Posted:
 # ================================================================ браузер (TikTok, вход во ВК)
 
 def save_cookies(ctx) -> None:
-    """Сохраняет сессии TikTok / X / Reddit в cookies.txt — их использует загрузчик."""
+    """Сохраняет сессии TikTok / Reddit / ВК / Instagram в cookies.txt — их использует загрузчик."""
     lines = ["# Netscape HTTP Cookie File"]
     for c in ctx.cookies():
         dom = c.get("domain", "")
-        if not any(k in dom for k in ("tiktok", "reddit", "vk.com", "vk.ru", "vkvideo")):
+        if not any(k in dom for k in ("tiktok", "reddit", "vk.com", "vk.ru", "vkvideo", "instagram")):
             continue
         exp = int(c.get("expires") or 0)
         lines.append("\t".join([dom, "TRUE" if dom.startswith(".") else "FALSE",
@@ -237,22 +237,53 @@ def ydl_opts(st: dict) -> dict:
     return opts
 
 
-def search_youtube(st: dict, q: str, n: int) -> list[dict]:
-    import yt_dlp
-    url = (f"https://www.youtube.com/hashtag/{quote(q[1:])}" if q.startswith("#")
-           else f"ytsearch{n}:{q}")
-    with yt_dlp.YoutubeDL(ydl_opts(st) | {"extract_flat": True, "playlistend": n}) as ydl:
-        info = ydl.extract_info(url, download=False)
+def query_stems(q: str) -> list[str]:
+    """Слова запроса без окончаний: «рыбалка» найдёт и «рыбалку», и «рыбалке»."""
     out = []
-    for e in (info.get("entries") or [])[:n]:
-        if not e or not e.get("id"):
-            continue
-        out.append({"source": "youtube", "id": e["id"],
-                    "url": e.get("url") or f"https://www.youtube.com/watch?v={e['id']}",
-                    "author": e.get("channel") or e.get("uploader") or "",
-                    "title": e.get("title") or "", "duration": _int(e.get("duration")),
-                    "views": _int(e.get("view_count"))})
+    for w in re.findall(r"\w+", q.casefold()):
+        out.append(w[:-2] if len(w) >= 6 else w[:-1] if len(w) == 5 else w)
     return out
+
+
+def text_match(item: dict, stems: list[str]) -> bool:
+    """Все слова запроса есть в названии или описании ролика (имя канала не считается)."""
+    text = f"{item.get('title') or ''} {item.get('desc') or ''}".casefold()
+    return all(s in text for s in stems)
+
+
+def _cut(items: list[dict], n: int, ok) -> list[dict]:
+    return [i for i in items if ok is None or ok(i)][:n]
+
+
+def search_youtube(st: dict, q: str, n: int, ok=None) -> list[dict]:
+    import yt_dlp
+    m = n if ok is None else min(max(n * 5, 30), 300)     # с запасом: часть отсеется
+    if q.startswith("@"):
+        urls = [f"https://www.youtube.com/{q}/shorts", f"https://www.youtube.com/{q}/videos"]
+    elif q.startswith("#"):
+        urls = [f"https://www.youtube.com/hashtag/{quote(q[1:])}"]
+    else:
+        urls = [f"ytsearch{m}:{q}"]
+    out, err = [], None
+    for url in urls:
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts(st) | {"extract_flat": True, "playlistend": m}) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as e:
+            err = e
+            continue
+        for e in (info.get("entries") or [])[:m]:
+            if not e or not e.get("id"):
+                continue
+            out.append({"source": "youtube", "id": e["id"],
+                        "url": e.get("url") or f"https://www.youtube.com/watch?v={e['id']}",
+                        "author": e.get("channel") or e.get("uploader") or q.lstrip("@"),
+                        "title": e.get("title") or "", "desc": e.get("description") or "",
+                        "duration": _int(e.get("duration")),
+                        "views": _int(e.get("view_count"))})
+    if not out and err:
+        raise err
+    return _cut(out, n, ok)
 
 
 def parse_vk(data, found: dict) -> None:
@@ -273,12 +304,16 @@ def parse_vk(data, found: dict) -> None:
             "source": "vk", "id": f"{owner}_{vid}",
             "url": f"https://vk.com/video{owner}_{vid}",
             "author": names.get(owner, str(owner)), "title": str(d.get("title") or ""),
+            "desc": str(d.get("description") or ""),
             "duration": _int(d.get("duration")),
             "views": _int(views.get("count") if isinstance(views, dict) else views)}
 
 
-def search_vk(st: dict, q: str, n: int) -> list[dict]:
-    return _browser_search(st, f"{VK_VIDEO}/?q={quote(q)}", ("search", "Search"), parse_vk, n)
+def search_vk(st: dict, q: str, n: int, ok=None) -> list[dict]:
+    if q.startswith("@"):
+        raise RuntimeError("поиск по автору (@имя) для ВК не сделан — вставь ссылки на ролики")
+    return _browser_search(st, f"{VK_VIDEO}/?q={quote(q.lstrip('#'))}", ("search", "Search"),
+                           parse_vk, n, ok)
 
 
 def parse_reddit(data: dict) -> list[dict]:
@@ -291,11 +326,14 @@ def parse_reddit(data: dict) -> list[dict]:
         out.append({"source": "reddit", "id": p.get("id", ""),
                     "url": "https://www.reddit.com" + p.get("permalink", ""),
                     "author": p.get("author") or "", "title": p.get("title") or "",
+                    "desc": p.get("selftext") or "",
                     "duration": _int(rv.get("duration")), "views": _int(p.get("score"))})
     return out
 
 
-def search_reddit(st: dict, q: str, n: int) -> list[dict]:
+def search_reddit(st: dict, q: str, n: int, ok=None) -> list[dict]:
+    if q.startswith("@"):
+        raise RuntimeError("поиск по автору (@имя) для Reddit не сделан")
     out, after = [], None
     for _ in range(5):                       # до 5 страниц по 100 постов
         r = requests.get("https://www.reddit.com/search.json",
@@ -308,10 +346,10 @@ def search_reddit(st: dict, q: str, n: int) -> list[dict]:
         data = r.json()
         out += parse_reddit(data)
         after = (data.get("data") or {}).get("after")
-        if len(out) >= n or not after:
+        if len(_cut(out, n, ok)) >= n or not after:
             break
         time.sleep(1.5)
-    return out[:n]
+    return _cut(out, n, ok)
 
 
 def parse_tiktok(data: dict, found: dict) -> None:
@@ -331,8 +369,37 @@ def parse_tiktok(data: dict, found: dict) -> None:
                       "views": _int(stats.get("playCount"))}
 
 
-def _browser_search(st: dict, url: str, marks: tuple, parser, n: int) -> list[dict]:
-    """Открывает страницу поиска и собирает ролики из ответов, которые она сама грузит."""
+def parse_instagram(data, found: dict) -> None:
+    """Достаёт видео из того, что страница Instagram сама загрузила (разбор терпимый)."""
+    for d in _walk(data):
+        code = d.get("code") or d.get("shortcode")
+        if not isinstance(code, str) or not code:
+            continue
+        is_video = (d.get("media_type") == 2 or d.get("is_video") is True
+                    or bool(d.get("video_versions")) or d.get("product_type") == "clips")
+        if not is_video:
+            continue
+        cap = d.get("caption")
+        text = cap.get("text") if isinstance(cap, dict) else cap if isinstance(cap, str) else None
+        if not text:
+            node = _find(d.get("edge_media_to_caption") or {}, "text")
+            text = node if isinstance(node, str) else ""
+        user = d.get("user") or d.get("owner") or {}
+        views = next((d[k] for k in ("play_count", "ig_play_count", "video_view_count",
+                                     "view_count") if d.get(k)), None)
+        old = found.get(code) or {}
+        found[code] = {"source": "instagram", "id": code,
+                       "url": f"https://www.instagram.com/reel/{code}/",
+                       "author": (user.get("username") if isinstance(user, dict) else "")
+                                 or old.get("author") or "",
+                       "title": (text or "").strip() or old.get("title") or "",
+                       "duration": _int(d.get("video_duration")) or old.get("duration"),
+                       "views": _int(views) or old.get("views")}
+
+
+def _browser_search(st: dict, url: str, marks: tuple, parser, n: int, ok=None,
+                    login_mark: str = "", login_hint: str = "") -> list[dict]:
+    """Открывает страницу и собирает ролики из данных, которые она сама грузит."""
     found: dict[str, dict] = {}
 
     def on_response(resp):
@@ -342,28 +409,63 @@ def _browser_search(st: dict, url: str, marks: tuple, parser, n: int) -> list[di
             except Exception:
                 pass
 
+    def good() -> int:
+        return len(_cut(list(found.values()), n, ok))
+
     with browser(st, headless=not st.get("show_browser", True)) as ctx:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.on("response", on_response)
         page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        deadline, last, idle = time.time() + 90, 0, 0
-        while len(found) < n and time.time() < deadline and idle < 12:
+        page.wait_for_timeout(2500)
+        if login_mark and login_mark in page.url:
+            raise RuntimeError(login_hint)
+        try:                                 # первая порция часто лежит прямо в странице
+            for text in page.evaluate(
+                    "() => [...document.querySelectorAll('script[type=\"application/json\"]')]"
+                    ".map(s => s.textContent)"):
+                try:
+                    parser(json.loads(text), found)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        deadline, last, idle = time.time() + 120, 0, 0
+        while good() < n and time.time() < deadline and idle < 12:
             page.mouse.wheel(0, 3000)
             page.wait_for_timeout(1500)
             idle = idle + 1 if len(found) == last else 0
             last = len(found)
-    return list(found.values())[:n]
+    return _cut(list(found.values()), n, ok)
 
 
-def search_tiktok(st: dict, q: str, n: int) -> list[dict]:
-    url = (f"https://www.tiktok.com/tag/{quote(q[1:])}" if q.startswith("#")
-           else f"https://www.tiktok.com/search/video?q={quote(q)}")
+def search_tiktok(st: dict, q: str, n: int, ok=None) -> list[dict]:
+    if q.startswith("@"):
+        url = f"https://www.tiktok.com/{q}"
+    elif q.startswith("#"):
+        url = f"https://www.tiktok.com/tag/{quote(q[1:])}"
+    else:
+        url = f"https://www.tiktok.com/search/video?q={quote(q)}"
     return _browser_search(st, url, ("/api/challenge/item_list", "/api/search/item/full",
-                                     "/api/search/general/full"), parse_tiktok, n)
+                                     "/api/search/general/full", "/api/post/item_list"),
+                           parse_tiktok, n, ok)
+
+
+def search_instagram(st: dict, q: str, n: int, ok=None) -> list[dict]:
+    """Instagram показывает поиск только вошедшим — работает после входа в окне программы."""
+    if q.startswith("@"):
+        url = f"https://www.instagram.com/{quote(q[1:])}/reels/"
+    elif q.startswith("#"):
+        url = f"https://www.instagram.com/explore/tags/{quote(q[1:])}/"
+    else:
+        url = f"https://www.instagram.com/explore/search/keyword/?q={quote(q)}"
+    return _browser_search(
+        st, url, ("/graphql", "/api/v1/"), parse_instagram, n, ok,
+        login_mark="/accounts/login",
+        login_hint="сначала войди в Instagram: «Аккаунты и настройки» → «Войти в Instagram»")
 
 
 SEARCHERS = {"youtube": search_youtube, "tiktok": search_tiktok, "vk": search_vk,
-             "reddit": search_reddit}
+             "reddit": search_reddit, "instagram": search_instagram}
 
 
 # ================================================================ добавление вручную
@@ -877,9 +979,9 @@ class Main(QtWidgets.QMainWindow):
             self.src_boxes[key] = cb
             lv.addWidget(cb)
         lv.addSpacing(8)
-        lv.addWidget(QtWidgets.QLabel("Слова или #хэштег:"))
+        lv.addWidget(QtWidgets.QLabel("Слова, #хэштег или @автор:"))
         self.query = QtWidgets.QLineEdit()
-        self.query.setPlaceholderText("например: #рецепты  или  смешные коты")
+        self.query.setPlaceholderText("#рецепты, смешные коты или @имя_канала")
         self.query.returnPressed.connect(self.start_search)
         lv.addWidget(self.query)
         lv.addWidget(QtWidgets.QLabel("Сколько видео с каждого источника:"))
@@ -890,6 +992,11 @@ class Main(QtWidgets.QMainWindow):
         self.only_short = QtWidgets.QCheckBox("Только короткие (до 3 минут)")
         self.only_short.setChecked(True)
         lv.addWidget(self.only_short)
+        self.strict = QtWidgets.QCheckBox("Слова должны быть в названии\nили описании ролика")
+        self.strict.setChecked(True)
+        self.strict.setToolTip("Отсеивает ролики, которые нашлись только по имени канала.\n"
+                               "Если находит слишком мало — сними галочку.")
+        lv.addWidget(self.strict)
         self.btn_search = QtWidgets.QPushButton("Найти")
         self.btn_search.clicked.connect(self.start_search)
         lv.addWidget(self.btn_search)
@@ -1127,13 +1234,15 @@ class Main(QtWidgets.QMainWindow):
         row.addWidget(self.yt_status, 1)
         lay.addLayout(row)
 
-        lay = box("TikTok, Reddit — только поиск",
+        lay = box("TikTok, Instagram, Reddit — только поиск",
                   "Откроется окно браузера: войди в аккаунт как обычно и закрой окно — приложение "
                   "запомнит вход. TikTok по хэштегам часто работает и без входа. "
-                  "Reddit входа не требует.")
+                  "Instagram без входа поиск не показывает совсем. Reddit входа не требует.")
         row = QtWidgets.QHBoxLayout()
         row.addWidget(button("Войти в TikTok", lambda: self.do_site_login(
             "TikTok", "https://www.tiktok.com/login")))
+        row.addWidget(button("Войти в Instagram", lambda: self.do_site_login(
+            "Instagram", "https://www.instagram.com/accounts/login/")))
         row.addStretch(1)
         lay.addLayout(row)
 
@@ -1403,18 +1512,27 @@ class Main(QtWidgets.QMainWindow):
             self.log("Впиши запрос и отметь хотя бы один источник.")
             return
         n, short = self.count.value(), self.only_short.isChecked()
+        strict, stems = self.strict.isChecked(), query_stems(q)
+        by_author = q.startswith("@")
+
+        def make_ok(key):
+            """Проверка ролика: длина и слова запроса в названии/описании."""
+            words = (strict and not by_author and stems
+                     and not (q.startswith("#") and key in ("youtube", "tiktok", "instagram")))
+            if not short and not words:
+                return None
+            return lambda i: ((not short or not i["duration"] or i["duration"] <= 180)
+                              and (not words or text_match(i, stems)))
 
         def fn():
             found, seen = [], set()
             for key in chosen:
                 self.bus.log.emit(f"Ищу в {SOURCE_NAMES[key]}: {q}")
                 try:
-                    items = SEARCHERS[key](self.st, q, n)
+                    items = SEARCHERS[key](self.st, q, n, make_ok(key))
                 except Exception as e:
                     self.bus.log.emit(f"{SOURCE_NAMES[key]}: не получилось — {e}")
                     continue
-                if short:
-                    items = [i for i in items if not i["duration"] or i["duration"] <= 180]
                 items = [i for i in items if (i["source"], i["id"]) not in seen]
                 seen |= {(i["source"], i["id"]) for i in items}
                 self.bus.log.emit(f"{SOURCE_NAMES[key]}: найдено {len(items)}")
@@ -1472,7 +1590,10 @@ class Main(QtWidgets.QMainWindow):
                               else QtCore.Qt.Unchecked)
             self.table.setItem(r, 0, chk)
             done = self.posted.any(f"{it['source']}:{it['id']}")
-            cells = [SOURCE_NAMES[it["source"]], it["author"], it["title"].replace("\n", " "),
+            title = it["title"]
+            if it.get("desc") and it["desc"].strip() not in title:
+                title = f"{title} · {it['desc'].strip()[:200]}"
+            cells = [SOURCE_NAMES[it["source"]], it["author"], title.replace("\n", " "),
                      fmt_dur(it["duration"]), fmt_num(it["views"]),
                      "уже заливалось" if done else ""]
             for c, text in enumerate(cells, start=1):
