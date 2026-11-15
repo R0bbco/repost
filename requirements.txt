@@ -1,4 +1,5 @@
 PySide6-Essentials>=6.6
+PySide6-Addons>=6.6
 yt-dlp[default]>=2025.11
 deno
 imageio-ffmpeg

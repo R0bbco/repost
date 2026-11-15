@@ -32,6 +32,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 # deno (нужен yt-dlp для YouTube) ставится рядом с python.exe — добавляем в PATH
 os.environ["PATH"] = os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", "")
 
+VERSION = "1.5"
+APP_FILES = ["repost_app.py", "README.md", "requirements.txt", "start.bat"]
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "RepostApp"
 DATA.mkdir(parents=True, exist_ok=True)
@@ -42,14 +44,17 @@ VK_VIDEO = "https://vkvideo.ru"
 YT_SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
              "https://www.googleapis.com/auth/youtube.readonly"]
 SOURCES = [("youtube", "YouTube"), ("tiktok", "TikTok"), ("vk", "ВКонтакте"),
-           ("reddit", "Reddit"), ("x", "X (Twitter)")]
-SOURCE_NAMES = dict(SOURCES)
+           ("reddit", "Reddit")]
+# источники, которые добавляются только вручную (ссылкой или файлом), без поиска
+SOURCE_NAMES = dict(SOURCES) | {"instagram": "Instagram", "link": "Ссылка", "file": "Файл"}
+VIDEO_EXT = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RepostApp/1.0"
 
 DEFAULTS = {
     "proxy": "", "show_browser": True, "add_credit": True, "pause_sec": 20,
     "vk_logged": False, "vk_groups": "", "vk_manual_publish": False,
     "out_dir": str(Path.home() / "Videos" / "Repost"),
+    "work_dir": "", "update_repo": "", "auto_update": True,
     "yt_client_secret": "", "yt_channels": [],
 }
 
@@ -83,6 +88,26 @@ def save_settings(st: dict) -> None:
     SETTINGS_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+def work_dir(st: dict) -> Path:
+    """Папка для временных файлов: ролик лежит там только пока заливается или смотрится."""
+    d = Path(st.get("work_dir") or DATA / "downloads")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def clean_work_dir(st: dict) -> int:
+    n = 0
+    for f in work_dir(st).glob("*"):
+        if f.is_file() and f.suffix.lower() in (".mp4", ".webm", ".mkv", ".part", ".m4a",
+                                                 ".ytdl", ".mov", ".temp"):
+            try:
+                f.unlink()
+                n += 1
+            except Exception:
+                pass
+    return n
+
+
 def proxies(st: dict) -> dict | None:
     return {"http": st["proxy"], "https": st["proxy"]} if st.get("proxy") else None
 
@@ -111,14 +136,14 @@ class Posted:
                        (item, dest, remote, int(time.time())))
 
 
-# ================================================================ браузер (TikTok, X, вход во ВК)
+# ================================================================ браузер (TikTok, вход во ВК)
 
 def save_cookies(ctx) -> None:
     """Сохраняет сессии TikTok / X / Reddit в cookies.txt — их использует загрузчик."""
     lines = ["# Netscape HTTP Cookie File"]
     for c in ctx.cookies():
         dom = c.get("domain", "")
-        if not any(k in dom for k in ("tiktok", "x.com", "twitter", "reddit", "vk.com", "vk.ru", "vkvideo")):
+        if not any(k in dom for k in ("tiktok", "reddit", "vk.com", "vk.ru", "vkvideo")):
             continue
         exp = int(c.get("expires") or 0)
         lines.append("\t".join([dom, "TRUE" if dom.startswith(".") else "FALSE",
@@ -306,25 +331,6 @@ def parse_tiktok(data: dict, found: dict) -> None:
                       "views": _int(stats.get("playCount"))}
 
 
-def parse_x(data, found: dict) -> None:
-    for d in _walk(data):
-        leg = d.get("legacy")
-        if not (d.get("rest_id") and isinstance(leg, dict) and "full_text" in leg):
-            continue
-        media = [m for m in (leg.get("extended_entities") or {}).get("media") or []
-                 if m.get("type") in ("video", "animated_gif")]
-        if not media:
-            continue
-        user = _find(d.get("core") or {}, "screen_name") or "i"
-        ms = (media[0].get("video_info") or {}).get("duration_millis")
-        found[d["rest_id"]] = {
-            "source": "x", "id": d["rest_id"],
-            "url": f"https://x.com/{user}/status/{d['rest_id']}", "author": user,
-            "title": " ".join(leg["full_text"].split())[:200],
-            "duration": _int(ms / 1000) if ms else None,
-            "views": _int((d.get("views") or {}).get("count"))}
-
-
 def _browser_search(st: dict, url: str, marks: tuple, parser, n: int) -> list[dict]:
     """Открывает страницу поиска и собирает ролики из ответов, которые она сама грузит."""
     found: dict[str, dict] = {}
@@ -356,21 +362,45 @@ def search_tiktok(st: dict, q: str, n: int) -> list[dict]:
                                      "/api/search/general/full"), parse_tiktok, n)
 
 
-def search_x(st: dict, q: str, n: int) -> list[dict]:
-    url = f"https://x.com/search?q={quote(q + ' filter:videos')}&src=typed_query&f=top"
-    return _browser_search(st, url, ("SearchTimeline",), parse_x, n)
-
-
 SEARCHERS = {"youtube": search_youtube, "tiktok": search_tiktok, "vk": search_vk,
-             "reddit": search_reddit, "x": search_x}
+             "reddit": search_reddit}
+
+
+# ================================================================ добавление вручную
+
+def item_from_link(st: dict, url: str) -> dict:
+    """Читает название, автора и длину ролика по ссылке (YouTube, TikTok, ВК, Reddit, Instagram…)."""
+    import yt_dlp
+    with yt_dlp.YoutubeDL(ydl_opts(st) | {"noplaylist": True}) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if info.get("entries"):
+        info = next((e for e in info["entries"] if e), info)
+    ext = (info.get("extractor_key") or info.get("extractor") or "").lower()
+    source = next((k for k in ("youtube", "tiktok", "instagram", "reddit") if k in ext),
+                  "vk" if ext.startswith("vk") else "link")
+    return {"source": source, "id": str(info.get("id") or abs(hash(url))),
+            "url": info.get("webpage_url") or url,
+            "author": info.get("uploader") or info.get("channel") or info.get("uploader_id") or "",
+            "title": (info.get("description") if source in ("tiktok", "instagram") else None)
+                     or info.get("title") or "",
+            "duration": _int(info.get("duration")), "views": _int(info.get("view_count"))}
+
+
+def item_from_file(path: str) -> dict:
+    p = Path(path)
+    return {"source": "file", "id": f"{p.name}_{p.stat().st_size}", "url": str(p),
+            "local": str(p), "author": "", "title": p.stem, "duration": None, "views": None}
 
 
 # ================================================================ скачивание
 
 def download(st: dict, item: dict) -> Path:
+    if item.get("local"):
+        if not Path(item["local"]).is_file():
+            raise FileNotFoundError(f"файл не найден: {item['local']}")
+        return Path(item["local"])
     import yt_dlp
-    out_dir = DATA / "downloads"
-    out_dir.mkdir(exist_ok=True)
+    out_dir = work_dir(st)
     fmt = ("best[format_note!*=watermarked][vcodec^=h264]/best[format_note!*=watermarked]/best"
            if item["source"] == "tiktok" else
            "bv*[height<=1080][vcodec^=avc1]+ba[ext=m4a]/b[height<=1080][ext=mp4]/"
@@ -656,7 +686,7 @@ def save_to_folder(st: dict, file: Path, title: str, item: dict) -> str:
 def make_texts(st: dict, item: dict) -> tuple[str, str]:
     title = (item["title"] or "").strip().split("\n")[0][:90] or "Видео"
     desc = (item["title"] or "").strip()
-    if st.get("add_credit", True):
+    if st.get("add_credit", True) and not item.get("local"):
         desc += f"\n\nАвтор: {item['author']}\nИсточник: {item['url']}"
     return title, desc.strip()
 
@@ -674,6 +704,105 @@ def update_ytdlp(log) -> None:
             log("Не удалось обновить загрузчик: " + res.stderr.strip()[-200:])
     except Exception as e:
         log(f"Не удалось обновить загрузчик: {e}")
+
+
+# ================================================================ просмотр
+
+def preview_stream(st: dict, item: dict) -> str:
+    """Прямая ссылка на поток для проигрывания без скачивания."""
+    import yt_dlp
+    with yt_dlp.YoutubeDL(ydl_opts(st) | {
+            "format": "b[ext=mp4][height<=720]/b[height<=720]/b"}) as ydl:
+        info = ydl.extract_info(item["url"], download=False)
+    if info.get("entries"):
+        info = info["entries"][0]
+    url = info.get("url")
+    if not url:
+        raise RuntimeError("нет прямой ссылки")
+    return url
+
+
+def preview_file(st: dict, item: dict) -> Path:
+    """Запасной вариант: маленькая копия во временной папке, удаляется после просмотра."""
+    import yt_dlp
+    opts = ydl_opts(st) | {"format": "b[height<=480]/bv*[height<=480]+ba/b",
+                           "merge_output_format": "mp4",
+                           "outtmpl": str(work_dir(st) / "preview_%(id)s.%(ext)s")}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(item["url"], download=True)
+        if info.get("entries"):
+            info = info["entries"][0]
+        rd = info.get("requested_downloads") or []
+        return Path(rd[0]["filepath"]) if rd else Path(ydl.prepare_filename(info))
+
+
+# ================================================================ обновления
+
+def _ver(v: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:4])
+
+
+def check_update(st: dict) -> str | None:
+    """Новая версия из GitHub-репозитория (владелец/репозиторий) или None."""
+    repo = (st.get("update_repo") or "").strip().strip("/")
+    repo = re.sub(r"^https?://github\.com/", "", repo)
+    if not repo:
+        return None
+    r = requests.get(f"https://raw.githubusercontent.com/{repo}/main/version.txt",
+                     proxies=proxies(st), timeout=20, headers={"Cache-Control": "no-cache"})
+    r.raise_for_status()
+    remote = r.text.strip()
+    return remote if _ver(remote) > _ver(VERSION) else None
+
+
+def _install(files: dict[str, bytes]) -> None:
+    """Проверяет и подменяет файлы программы; старые сохраняются в папку backup."""
+    if "repost_app.py" not in files:
+        raise RuntimeError("в обновлении нет repost_app.py")
+    compile(files["repost_app.py"], "repost_app.py", "exec")      # битый файл не ставим
+    backup = DATA / "backup"
+    backup.mkdir(exist_ok=True)
+    for name, data in files.items():
+        cur = APP_DIR / name
+        if cur.is_file():
+            shutil.copy2(cur, backup / name)
+        tmp = cur.with_suffix(cur.suffix + ".new")
+        tmp.write_bytes(data)
+        os.replace(tmp, cur)
+
+
+def download_update(st: dict) -> None:
+    repo = re.sub(r"^https?://github\.com/", "", st["update_repo"].strip().strip("/"))
+    files = {}
+    for name in APP_FILES:
+        r = requests.get(f"https://raw.githubusercontent.com/{repo}/main/{name}",
+                         proxies=proxies(st), timeout=60, headers={"Cache-Control": "no-cache"})
+        if r.status_code == 404 and name != "repost_app.py":
+            continue
+        r.raise_for_status()
+        files[name] = r.content
+    _install(files)
+
+
+def install_from_zip(path: str) -> None:
+    import zipfile
+    files = {}
+    with zipfile.ZipFile(path) as z:
+        for info in z.infolist():
+            name = info.filename.replace("\\", "/").split("/")[-1]
+            if name in APP_FILES:
+                files[name] = z.read(info)
+    _install(files)
+
+
+def restart_app() -> None:
+    bat = APP_DIR / "start.bat"
+    if os.name == "nt" and bat.is_file():
+        subprocess.Popen(["cmd", "/c", str(bat)], cwd=str(APP_DIR),
+                         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+    else:
+        subprocess.Popen([sys.executable, str(APP_DIR / "repost_app.py")], cwd=str(APP_DIR))
+    QtWidgets.QApplication.quit()
 
 
 # ================================================================ окно
@@ -694,6 +823,9 @@ class Bus(QtCore.QObject):
     row_status = QtCore.Signal(str, str)
     finished = QtCore.Signal()
     accounts = QtCore.Signal()
+    preview = QtCore.Signal(str, str)        # (источник: "url" | "file" | "error", значение)
+    update_found = QtCore.Signal(str)
+    added = QtCore.Signal(list)
 
 
 class Main(QtWidgets.QMainWindow):
@@ -711,17 +843,28 @@ class Main(QtWidgets.QMainWindow):
         self.bus.row_status.connect(self.set_row_status)
         self.bus.finished.connect(self.on_finished)
         self.bus.accounts.connect(self.refresh_accounts)
+        self.bus.preview.connect(self.on_preview)
+        self.bus.update_found.connect(self.on_update_found)
+        self.bus.added.connect(self.add_items)
+        self.preview_item: dict | None = None
+        self.preview_tmp: Path | None = None
 
         self.setWindowTitle("Репостер")
         self.resize(1280, 780)
         tabs = QtWidgets.QTabWidget()
         tabs.addTab(self.build_main_tab(), "Поиск и заливка")
-        tabs.addTab(self.build_accounts_tab(), "Аккаунты")
+        tabs.addTab(self.build_accounts_tab(), "Аккаунты и настройки")
         tabs.addTab(self.build_help_tab(), "Помощь")
         self.setCentralWidget(tabs)
         self.refresh_accounts()
-        self.log(f"Данные приложения: {DATA}")
+        self.setWindowTitle(f"Репостер {VERSION}")
+        self.log(f"Версия {VERSION}. Данные приложения: {DATA}")
+        n = clean_work_dir(self.st)
+        if n:
+            self.log(f"Удалено временных файлов от прошлого запуска: {n}")
         threading.Thread(target=update_ytdlp, args=(self.bus.log.emit,), daemon=True).start()
+        if self.st.get("auto_update") and self.st.get("update_repo"):
+            threading.Thread(target=self._check_update_bg, args=(False,), daemon=True).start()
 
     # ---------- вкладка «Поиск и заливка»
     def build_main_tab(self) -> QtWidgets.QWidget:
@@ -750,6 +893,18 @@ class Main(QtWidgets.QMainWindow):
         self.btn_search = QtWidgets.QPushButton("Найти")
         self.btn_search.clicked.connect(self.start_search)
         lv.addWidget(self.btn_search)
+        lv.addSpacing(14)
+        lab = QtWidgets.QLabel("Или добавить без поиска:")
+        lv.addWidget(lab)
+        b = QtWidgets.QPushButton("Вставить ссылки…")
+        b.setToolTip("Ссылки на ролики из Instagram, TikTok, YouTube, ВК, Reddit и других сайтов")
+        b.clicked.connect(self.add_links)
+        lv.addWidget(b)
+        b = QtWidgets.QPushButton("Добавить файлы с компьютера…")
+        b.clicked.connect(self.add_files)
+        lv.addWidget(b)
+        self.keep_list = QtWidgets.QCheckBox("Новый поиск не очищает список")
+        lv.addWidget(self.keep_list)
         lv.addStretch(1)
 
         mid = QtWidgets.QGroupBox("2. Найденные видео — отметь нужные")
@@ -762,16 +917,16 @@ class Main(QtWidgets.QMainWindow):
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
-        self.table.cellDoubleClicked.connect(
-            lambda r, c: webbrowser.open(self.items[r]["url"]))
-        mv.addWidget(self.table)
+        self.table.cellDoubleClicked.connect(lambda r, c: self.start_preview(r))
+        mv.addWidget(self.table, 3)
+        mv.addWidget(self.build_player(), 2)
         row = QtWidgets.QHBoxLayout()
         for text, fn in (("Отметить все", lambda: self.check_all(True)),
                          ("Снять отметки", lambda: self.check_all(False))):
             b = QtWidgets.QPushButton(text)
             b.clicked.connect(fn)
             row.addWidget(b)
-        row.addWidget(QtWidgets.QLabel("Двойной щелчок по строке — открыть видео"))
+        row.addWidget(QtWidgets.QLabel("Двойной щелчок по строке — посмотреть"))
         row.addStretch(1)
         mv.addLayout(row)
 
@@ -779,7 +934,7 @@ class Main(QtWidgets.QMainWindow):
         rv = QtWidgets.QVBoxLayout(right)
         self.dest_list = QtWidgets.QListWidget()
         rv.addWidget(self.dest_list)
-        self.no_dest = QtWidgets.QLabel("ВК и YouTube подключаются\nна вкладке «Аккаунты».")
+        self.no_dest = QtWidgets.QLabel("ВК и YouTube подключаются\nна вкладке «Аккаунты и настройки».")
         rv.addWidget(self.no_dest)
         self.credit = QtWidgets.QCheckBox("Указывать автора и ссылку\nна оригинал в описании")
         self.credit.setChecked(self.st["add_credit"])
@@ -802,6 +957,126 @@ class Main(QtWidgets.QMainWindow):
         vsplit.addWidget(self.log_box)
         vsplit.setSizes([560, 160])
         return vsplit
+
+    def build_player(self) -> QtWidgets.QWidget:
+        from PySide6 import QtMultimedia, QtMultimediaWidgets
+        box = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.video = QtMultimediaWidgets.QVideoWidget()
+        self.video.setMinimumSize(200, 180)
+        self.video.setStyleSheet("background:#111")
+        self.player = QtMultimedia.QMediaPlayer(self)
+        self.audio = QtMultimedia.QAudioOutput(self)
+        self.player.setAudioOutput(self.audio)
+        self.player.setVideoOutput(self.video)
+        self.player.setLoops(QtMultimedia.QMediaPlayer.Loops.Infinite)
+        self.player.errorOccurred.connect(self.on_player_error)
+        lay.addWidget(self.video, 1)
+        side = QtWidgets.QVBoxLayout()
+        self.preview_title = QtWidgets.QLabel("Двойной щелчок по видео в списке —\nи оно покажется здесь")
+        self.preview_title.setWordWrap(True)
+        self.preview_title.setMaximumWidth(260)
+        side.addWidget(self.preview_title)
+        for text, fn in (("▶ / ❚❚", self.toggle_play), ("Звук вкл/выкл", self.toggle_mute),
+                         ("Открыть в браузере", self.open_in_browser),
+                         ("Отметить для заливки", self.check_previewed)):
+            b = QtWidgets.QPushButton(text)
+            b.clicked.connect(fn)
+            side.addWidget(b)
+        side.addStretch(1)
+        lay.addLayout(side)
+        return box
+
+    # ---------- просмотр
+    def start_preview(self, row: int) -> None:
+        it = self.items[row]
+        self.preview_item = it
+        self.stop_preview()
+        self.preview_title.setText(f"{SOURCE_NAMES[it['source']]} · {it['author']}\n"
+                                   f"{it['title'][:120]}\n\nзагружаю…")
+        if it.get("local"):
+            self.preview_kind = "local"
+            self.preview_title.setText(f"Файл\n{it['title'][:120]}")
+            self.player.setSource(QtCore.QUrl.fromLocalFile(it["local"]))
+            self.player.play()
+            return
+
+        def work():
+            try:
+                self.bus.preview.emit("url", preview_stream(self.st, it))
+            except Exception as e:
+                self.bus.log.emit(f"Просмотр потоком не вышел ({e}), пробую через временный файл…")
+                self._preview_fallback(it)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _preview_fallback(self, it: dict) -> None:
+        try:
+            self.bus.preview.emit("file", str(preview_file(self.st, it)))
+        except Exception as e:
+            self.bus.preview.emit("error", str(e))
+
+    def on_preview(self, kind: str, value: str) -> None:
+        it = self.preview_item
+        if not it:
+            return
+        head = f"{SOURCE_NAMES[it['source']]} · {it['author']}\n{it['title'][:120]}"
+        if kind == "error":
+            self.preview_title.setText(head + "\n\nне удалось показать — открой в браузере")
+            self.log(f"Просмотр: {value}")
+            return
+        if kind == "file":
+            self.preview_tmp = Path(value)
+            self.player.setSource(QtCore.QUrl.fromLocalFile(value))
+        else:
+            self.preview_tmp = None
+            self.player.setSource(QtCore.QUrl(value))
+        self.preview_kind = kind
+        self.preview_title.setText(head)
+        self.player.play()
+
+    def on_player_error(self, err, text: str = "") -> None:
+        it = self.preview_item
+        if not it or err == self.player.Error.NoError:
+            return
+        if getattr(self, "preview_kind", "") == "url":
+            self.preview_kind = "fallback"
+            self.log("Плеер не смог открыть поток, скачиваю маленькую копию для просмотра…")
+            threading.Thread(target=self._preview_fallback, args=(it,), daemon=True).start()
+        else:
+            self.bus.preview.emit("error", text or str(err))
+
+    def stop_preview(self) -> None:
+        self.player.stop()
+        self.player.setSource(QtCore.QUrl())
+        if self.preview_tmp:
+            try:
+                self.preview_tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self.preview_tmp = None
+
+    def toggle_play(self) -> None:
+        if self.player.playbackState() == self.player.PlaybackState.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+
+    def toggle_mute(self) -> None:
+        self.audio.setMuted(not self.audio.isMuted())
+
+    def open_in_browser(self) -> None:
+        if self.preview_item:
+            webbrowser.open(self.preview_item["url"])
+
+    def check_previewed(self) -> None:
+        for r, it in enumerate(self.items):
+            if it is self.preview_item:
+                self.table.item(r, 0).setCheckState(QtCore.Qt.Checked)
+
+    def closeEvent(self, ev) -> None:
+        self.stop_preview()
+        super().closeEvent(ev)
 
     # ---------- вкладка «Аккаунты»
     def build_accounts_tab(self) -> QtWidgets.QWidget:
@@ -852,27 +1127,25 @@ class Main(QtWidgets.QMainWindow):
         row.addWidget(self.yt_status, 1)
         lay.addLayout(row)
 
-        lay = box("TikTok, X (Twitter), Reddit — только поиск",
+        lay = box("TikTok, Reddit — только поиск",
                   "Откроется окно браузера: войди в аккаунт как обычно и закрой окно — приложение "
-                  "запомнит вход. TikTok по хэштегам часто работает и без входа; X без входа не ищет. "
+                  "запомнит вход. TikTok по хэштегам часто работает и без входа. "
                   "Reddit входа не требует.")
         row = QtWidgets.QHBoxLayout()
         row.addWidget(button("Войти в TikTok", lambda: self.do_site_login(
             "TikTok", "https://www.tiktok.com/login")))
-        row.addWidget(button("Войти в X", lambda: self.do_site_login(
-            "X", "https://x.com/i/flow/login")))
         row.addStretch(1)
         lay.addLayout(row)
 
         lay = box("Интернет",
-                  "TikTok, X и YouTube из России работают только через VPN. Проще всего включить VPN "
+                  "TikTok, YouTube и Instagram из России работают только через VPN. Проще всего включить VPN "
                   "на компьютере. Поле «Прокси» заполняй, только если у тебя именно прокси, а не VPN.")
         form = QtWidgets.QFormLayout()
         self.proxy = QtWidgets.QLineEdit(self.st["proxy"])
         self.proxy.setPlaceholderText("пусто  или  socks5://логин:пароль@адрес:порт")
         form.addRow("Прокси:", self.proxy)
         self.show_browser = QtWidgets.QCheckBox(
-            "Показывать окно браузера при поиске в TikTok и X (надёжнее, можно пройти капчу)")
+            "Показывать окно браузера при поиске в TikTok и ВК (надёжнее, можно пройти капчу)")
         self.show_browser.setChecked(self.st["show_browser"])
         form.addRow(self.show_browser)
         self.pause = QtWidgets.QSpinBox()
@@ -880,14 +1153,46 @@ class Main(QtWidgets.QMainWindow):
         self.pause.setValue(self.st["pause_sec"])
         form.addRow("Пауза между заливками, сек:", self.pause)
         lay.addLayout(form)
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(button("Папка для скачанных видео…", self.pick_folder))
-        self.out_label = QtWidgets.QLabel(self.st["out_dir"])
-        row.addWidget(self.out_label, 1)
-        lay.addLayout(row)
         lay.addWidget(button("Сохранить настройки", self.save_form))
+
+        lay = box("Папки",
+                  "Временная папка — куда видео ненадолго скачивается перед заливкой; после заливки "
+                  "файл сразу удаляется. Можно указать другой диск или флешку, чтобы не занимать "
+                  "системный. Папка «Скачать» — для площадки «Папка на компьютере», там видео "
+                  "остаются насовсем.")
+        grid = QtWidgets.QGridLayout()
+        self.work_label = QtWidgets.QLabel()
+        self.out_label = QtWidgets.QLabel(self.st["out_dir"])
+        for r, (name, lab, fn) in enumerate((
+                ("Временная:", self.work_label, self.pick_work_dir),
+                ("Скачать:", self.out_label, self.pick_folder))):
+            grid.addWidget(QtWidgets.QLabel(name), r, 0)
+            grid.addWidget(lab, r, 1)
+            grid.addWidget(button("Выбрать…", fn), r, 2)
+            grid.addWidget(button("Открыть", lambda _=False, l=lab: self.open_folder(
+                l.property("path") or l.text())), r, 3)
+        grid.setColumnStretch(1, 1)
+        lay.addLayout(grid)
+        self.update_work_label()
+
+        lay = box("Обновления",
+                  "Программа сама проверяет обновления при запуске и предлагает установить. "
+                  "Источник — GitHub-репозиторий (как его завести — «Помощь», раздел «Обновления»). "
+                  "Если обновление пришло архивом в чате — нажми «Установить из архива».")
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel(f"Версия {VERSION}.  Репозиторий:"))
+        self.update_repo = QtWidgets.QLineEdit(self.st["update_repo"])
+        self.update_repo.setPlaceholderText("логин/repost  или  https://github.com/логин/repost")
+        row.addWidget(self.update_repo, 1)
+        row.addWidget(button("Проверить сейчас", lambda: self.check_update_now()))
+        row.addWidget(button("Установить из архива…", self.update_from_zip))
+        lay.addLayout(row)
         v.addStretch(1)
-        return w
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(w)
+        return scroll
 
     def build_help_tab(self) -> QtWidgets.QWidget:
         tb = QtWidgets.QTextBrowser()
@@ -911,7 +1216,8 @@ class Main(QtWidgets.QMainWindow):
         self.st.update(proxy=self.proxy.text().strip(), vk_groups=self.vk_groups.toPlainText(),
                        vk_manual_publish=self.vk_manual.isChecked(),
                        show_browser=self.show_browser.isChecked(), pause_sec=self.pause.value(),
-                       add_credit=self.credit.isChecked())
+                       add_credit=self.credit.isChecked(),
+                       update_repo=self.update_repo.text().strip())
         save_settings(self.st)
         self.refresh_accounts()
 
@@ -922,6 +1228,83 @@ class Main(QtWidgets.QMainWindow):
             self.st["out_dir"] = path
             self.out_label.setText(path)
             save_settings(self.st)
+
+    def open_folder(self, path: str) -> None:
+        Path(path).mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            os.startfile(path)
+        else:
+            webbrowser.open(Path(path).as_uri())
+
+    def update_work_label(self) -> None:
+        d = work_dir(self.st)
+        self.work_label.setProperty("path", str(d))
+        try:
+            free = shutil.disk_usage(d).free / 1024 ** 3
+            self.work_label.setText(f"{d}   (свободно {free:.0f} ГБ)")
+        except Exception:
+            self.work_label.setText(str(d))
+
+    def pick_work_dir(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Временная папка",
+                                                          str(work_dir(self.st)))
+        if path:
+            clean_work_dir(self.st)
+            self.st["work_dir"] = path
+            save_settings(self.st)
+            self.update_work_label()
+
+    # ---------- обновления
+    def _check_update_bg(self, loud: bool) -> None:
+        try:
+            new = check_update(self.st)
+            if new:
+                self.bus.update_found.emit(new)
+            elif loud:
+                self.bus.log.emit(f"Обновлений нет, у тебя последняя версия ({VERSION}).")
+        except Exception as e:
+            self.bus.log.emit(f"Не удалось проверить обновления: {e}")
+
+    def check_update_now(self) -> None:
+        self.save_form()
+        if not self.st["update_repo"]:
+            self.log("Впиши адрес репозитория с обновлениями.")
+            return
+        threading.Thread(target=self._check_update_bg, args=(True,), daemon=True).start()
+
+    def on_update_found(self, new: str) -> None:
+        if self.busy:
+            self.log(f"Есть обновление {new} — установлю, когда закончится текущее действие. "
+                     "Нажми «Проверить сейчас» позже.")
+            return
+        ask = QtWidgets.QMessageBox.question(
+            self, "Обновление", f"Вышла версия {new} (у тебя {VERSION}).\nУстановить сейчас? "
+            "Программа перезапустится.")
+        if ask != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            download_update(self.st)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Обновление", f"Не получилось: {e}")
+            return
+        self.stop_preview()
+        restart_app()
+
+    def update_from_zip(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Архив с обновлением (Repost.zip)", str(Path.home() / "Downloads"),
+            "Архив (*.zip)")
+        if not path:
+            return
+        try:
+            install_from_zip(path)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Обновление", f"Не получилось: {e}")
+            return
+        QtWidgets.QMessageBox.information(self, "Обновление",
+                                          "Установлено. Программа перезапустится.")
+        self.stop_preview()
+        restart_app()
 
     def run_bg(self, what: str, fn) -> None:
         if self.busy:
@@ -1039,13 +1422,54 @@ class Main(QtWidgets.QMainWindow):
             self.bus.results.emit(found)
         self.run_bg("Поиск", fn)
 
-    def show_results(self, items: list) -> None:
+    def add_links(self) -> None:
+        text, ok = QtWidgets.QInputDialog.getMultiLineText(
+            self, "Вставить ссылки", "Ссылки на видео, по одной в строке:")
+        urls = list(dict.fromkeys(re.findall(r"https?://\S+", text or "")))
+        if not ok or not urls:
+            return
+
+        def fn():
+            new = []
+            for n, url in enumerate(urls, 1):
+                try:
+                    new.append(item_from_link(self.st, url))
+                    self.bus.log.emit(f"[{n}/{len(urls)}] добавлено: {new[-1]['title'][:60] or url}")
+                except Exception as e:
+                    msg = str(e)
+                    if "login" in msg.lower() or "cookies" in msg.lower():
+                        msg = "сайт отдаёт это видео только после входа в аккаунт"
+                    self.bus.log.emit(f"[{n}/{len(urls)}] не получилось ({url}): {msg[:200]}")
+            self.bus.added.emit(new)
+        self.run_bg("Ссылки", fn)
+
+    def add_files(self) -> None:
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Видео с компьютера", self.st["out_dir"],
+            "Видео (" + " ".join("*" + e for e in VIDEO_EXT) + ");;Все файлы (*)")
+        if paths:
+            self.add_items([item_from_file(p) for p in paths])
+
+    def add_items(self, new: list) -> None:
+        """Дописывает ролики в конец списка, сохраняя отметки; новые сразу отмечены."""
+        have = {f"{i['source']}:{i['id']}" for i in self.items}
+        new = [i for i in new if f"{i['source']}:{i['id']}" not in have]
+        marks = {f"{it['source']}:{it['id']}" for r, it in enumerate(self.items)
+                 if self.table.item(r, 0).checkState() == QtCore.Qt.Checked}
+        marks |= {f"{i['source']}:{i['id']}" for i in new}
+        self.show_results(self.items + new, marks)
+
+    def show_results(self, items: list, marks: set | None = None) -> None:
+        if marks is None and self.keep_list.isChecked() and self.items:
+            return self.add_items_unmarked(items)
+        marks = marks or set()
         self.items = items
         self.table.setRowCount(len(items))
         for r, it in enumerate(items):
             chk = QtWidgets.QTableWidgetItem()
             chk.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
-            chk.setCheckState(QtCore.Qt.Unchecked)
+            chk.setCheckState(QtCore.Qt.Checked if f"{it['source']}:{it['id']}" in marks
+                              else QtCore.Qt.Unchecked)
             self.table.setItem(r, 0, chk)
             done = self.posted.any(f"{it['source']}:{it['id']}")
             cells = [SOURCE_NAMES[it["source"]], it["author"], it["title"].replace("\n", " "),
@@ -1054,6 +1478,13 @@ class Main(QtWidgets.QMainWindow):
             for c, text in enumerate(cells, start=1):
                 self.table.setItem(r, c, QtWidgets.QTableWidgetItem(text))
         self.log(f"Всего в списке: {len(items)}")
+
+    def add_items_unmarked(self, new: list) -> None:
+        have = {f"{i['source']}:{i['id']}" for i in self.items}
+        marks = {f"{it['source']}:{it['id']}" for r, it in enumerate(self.items)
+                 if self.table.item(r, 0).checkState() == QtCore.Qt.Checked}
+        self.show_results(self.items + [i for i in new
+                                        if f"{i['source']}:{i['id']}" not in have], marks)
 
     def check_all(self, on: bool) -> None:
         for r in range(self.table.rowCount()):
@@ -1119,7 +1550,7 @@ class Main(QtWidgets.QMainWindow):
                     self.bus.row_status.emit(key, "не скачалось")
                     self.bus.log.emit(f"   ✖ не скачалось: {e}")
                 finally:
-                    if file and file.exists():
+                    if file and file.exists() and not it.get("local"):
                         file.unlink()
                 if n < len(picked) and self.st["pause_sec"]:
                     time.sleep(self.st["pause_sec"] * random.uniform(0.7, 1.3))
@@ -1130,7 +1561,16 @@ class Main(QtWidgets.QMainWindow):
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
-    win = Main()
+    try:
+        win = Main()
+    except Exception:
+        err = traceback.format_exc()
+        (DATA / "crash.log").write_text(err, encoding="utf-8")
+        QtWidgets.QMessageBox.critical(
+            None, "Репостер не запустился",
+            "Ошибка при запуске. Пришли разработчику текст ниже "
+            f"(он также сохранён в {DATA / 'crash.log'}):\n\n" + err[-1500:])
+        sys.exit(1)
     win.show()
     sys.exit(app.exec())
 
