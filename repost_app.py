@@ -32,7 +32,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 # deno (нужен yt-dlp для YouTube) ставится рядом с python.exe — добавляем в PATH
 os.environ["PATH"] = os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", "")
 
-VERSION = "1.6"
+VERSION = "1.7"
 APP_FILES = ["repost_app.py", "README.md", "requirements.txt", "start.bat"]
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "RepostApp"
@@ -43,7 +43,7 @@ COOKIES_FILE = DATA / "cookies.txt"
 VK_VIDEO = "https://vkvideo.ru"
 YT_SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
              "https://www.googleapis.com/auth/youtube.readonly"]
-SOURCES = [("youtube", "YouTube"), ("tiktok", "TikTok"), ("vk", "ВКонтакте"),
+SOURCES = [("youtube", "YouTube"), ("shorts", "YouTube Shorts"), ("tiktok", "TikTok"), ("vk", "ВКонтакте"),
            ("reddit", "Reddit"), ("instagram", "Instagram")]
 # источники, которые добавляются только вручную (ссылкой или файлом), без поиска
 SOURCE_NAMES = dict(SOURCES) | {"link": "Ссылка", "file": "Файл"}
@@ -54,7 +54,7 @@ DEFAULTS = {
     "proxy": "", "show_browser": True, "add_credit": True, "pause_sec": 20,
     "vk_logged": False, "vk_groups": "", "vk_manual_publish": False,
     "out_dir": str(Path.home() / "Videos" / "Repost"),
-    "work_dir": "", "update_repo": "", "auto_update": True,
+    "volume": 70, "work_dir": "", "update_repo": "", "auto_update": True,
     "yt_client_secret": "", "yt_channels": [],
 }
 
@@ -251,8 +251,55 @@ def text_match(item: dict, stems: list[str]) -> bool:
     return all(s in text for s in stems)
 
 
+STATS = {"seen": 0}      # сколько роликов сайт отдал в последнем поиске (до отсева)
+
+
 def _cut(items: list[dict], n: int, ok) -> list[dict]:
+    STATS["seen"] = len(items)
     return [i for i in items if ok is None or ok(i)][:n]
+
+
+def _yt_flat(st: dict, url: str, m: int, author: str = "") -> list[dict]:
+    import yt_dlp
+    with yt_dlp.YoutubeDL(ydl_opts(st) | {"extract_flat": True, "playlistend": m}) as ydl:
+        info = ydl.extract_info(url, download=False)
+    out = []
+    for e in (info.get("entries") or [])[:m]:
+        if not e or not e.get("id"):
+            continue
+        out.append({"source": "youtube", "id": e["id"],
+                    "url": e.get("url") or f"https://www.youtube.com/watch?v={e['id']}",
+                    "author": e.get("channel") or e.get("uploader") or author,
+                    "title": e.get("title") or "", "desc": e.get("description") or "",
+                    "duration": _int(e.get("duration")), "views": _int(e.get("view_count"))})
+    return out
+
+
+def search_shorts(st: dict, q: str, n: int, ok=None) -> list[dict]:
+    """Только YouTube Shorts: по хэштегу, по автору или по словам."""
+    m = min(max(n * 5, 40), 300)
+    if q.startswith("@"):
+        return _cut(_yt_flat(st, f"https://www.youtube.com/{q}/shorts", n, q[1:]), n, None)
+    if q.startswith("#"):
+        return _cut(_yt_flat(st, f"https://www.youtube.com/hashtag/{quote(q[1:])}/shorts", n),
+                    n, None)
+    # обычный поиск YouTube с пометкой #shorts; Shorts не бывают длиннее 3 минут
+    found = [i for i in _yt_flat(st, f"ytsearch{m}:{q} #shorts", m)
+             if i["duration"] and i["duration"] <= 180]
+    seen = len(found)
+    out = [i for i in found if ok is None or ok(i)][:n]
+    if len(out) < n and len(q.split()) == 1:      # одно слово — добираем со страницы хэштега
+        try:
+            have = {i["id"] for i in out}
+            extra = _yt_flat(st, f"https://www.youtube.com/hashtag/{quote(q)}/shorts", n * 2)
+            seen += len(extra)
+            out += [i for i in extra if i["id"] not in have][:n - len(out)]
+        except Exception:
+            pass
+    for i in out:
+        i["url"] = f"https://www.youtube.com/shorts/{i['id']}"
+    STATS["seen"] = seen
+    return out
 
 
 def search_youtube(st: dict, q: str, n: int, ok=None) -> list[dict]:
@@ -464,7 +511,7 @@ def search_instagram(st: dict, q: str, n: int, ok=None) -> list[dict]:
         login_hint="сначала войди в Instagram: «Аккаунты и настройки» → «Войти в Instagram»")
 
 
-SEARCHERS = {"youtube": search_youtube, "tiktok": search_tiktok, "vk": search_vk,
+SEARCHERS = {"youtube": search_youtube, "shorts": search_shorts, "tiktok": search_tiktok, "vk": search_vk,
              "reddit": search_reddit, "instagram": search_instagram}
 
 
@@ -1079,7 +1126,21 @@ class Main(QtWidgets.QMainWindow):
         self.player.setVideoOutput(self.video)
         self.player.setLoops(QtMultimedia.QMediaPlayer.Loops.Infinite)
         self.player.errorOccurred.connect(self.on_player_error)
-        lay.addWidget(self.video, 1)
+        left = QtWidgets.QVBoxLayout()
+        left.addWidget(self.video, 1)
+        bar = QtWidgets.QHBoxLayout()
+        self.seek = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.seek.setRange(0, 0)
+        self.seek.setToolTip("Перемотка")
+        self.seek.sliderMoved.connect(self.player.setPosition)
+        self.seek.sliderReleased.connect(lambda: self.player.setPosition(self.seek.value()))
+        self.time_label = QtWidgets.QLabel("0:00 / 0:00")
+        bar.addWidget(self.seek, 1)
+        bar.addWidget(self.time_label)
+        left.addLayout(bar)
+        self.player.durationChanged.connect(lambda d: self.seek.setRange(0, max(d, 0)))
+        self.player.positionChanged.connect(self.on_position)
+        lay.addLayout(left, 1)
         side = QtWidgets.QVBoxLayout()
         self.preview_title = QtWidgets.QLabel("Двойной щелчок по видео в списке —\nи оно покажется здесь")
         self.preview_title.setWordWrap(True)
@@ -1091,9 +1152,28 @@ class Main(QtWidgets.QMainWindow):
             b = QtWidgets.QPushButton(text)
             b.clicked.connect(fn)
             side.addWidget(b)
+        side.addWidget(QtWidgets.QLabel("Громкость:"))
+        self.volume = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.volume.setRange(0, 100)
+        self.volume.setValue(int(self.st.get("volume", 70)))
+        self.volume.valueChanged.connect(self.on_volume)
+        self.audio.setVolume(self.volume.value() / 100)
+        side.addWidget(self.volume)
         side.addStretch(1)
         lay.addLayout(side)
         return box
+
+    def on_position(self, pos: int) -> None:
+        if not self.seek.isSliderDown():
+            self.seek.setValue(pos)
+        self.time_label.setText(f"{fmt_dur(pos // 1000) or '0:00'} / "
+                                f"{fmt_dur(self.player.duration() // 1000) or '0:00'}")
+
+    def on_volume(self, v: int) -> None:
+        self.audio.setVolume(v / 100)
+        if v and self.audio.isMuted():
+            self.audio.setMuted(False)
+        self.st["volume"] = v
 
     # ---------- просмотр
     def start_preview(self, row: int) -> None:
@@ -1183,6 +1263,10 @@ class Main(QtWidgets.QMainWindow):
 
     def closeEvent(self, ev) -> None:
         self.stop_preview()
+        try:
+            save_settings(self.st)
+        except Exception:
+            pass
         super().closeEvent(ev)
 
     # ---------- вкладка «Аккаунты»
@@ -1518,7 +1602,8 @@ class Main(QtWidgets.QMainWindow):
         def make_ok(key):
             """Проверка ролика: длина и слова запроса в названии/описании."""
             words = (strict and not by_author and stems
-                     and not (q.startswith("#") and key in ("youtube", "tiktok", "instagram")))
+                     and not (q.startswith("#") and key in ("youtube", "shorts", "tiktok",
+                                                            "instagram")))
             if not short and not words:
                 return None
             return lambda i: ((not short or not i["duration"] or i["duration"] <= 180)
@@ -1531,11 +1616,19 @@ class Main(QtWidgets.QMainWindow):
                 try:
                     items = SEARCHERS[key](self.st, q, n, make_ok(key))
                 except Exception as e:
-                    self.bus.log.emit(f"{SOURCE_NAMES[key]}: не получилось — {e}")
+                    msg = str(e)
+                    if "has been closed" in msg:
+                        msg = ("окно браузера закрылось раньше времени. Не закрывай его, пока "
+                               "идёт поиск — оно закроется само")
+                    self.bus.log.emit(f"{SOURCE_NAMES[key]}: не получилось — {msg}")
                     continue
                 items = [i for i in items if (i["source"], i["id"]) not in seen]
                 seen |= {(i["source"], i["id"]) for i in items}
-                self.bus.log.emit(f"{SOURCE_NAMES[key]}: найдено {len(items)}")
+                note = ""
+                if STATS["seen"] > len(items) and len(items) < n:
+                    note = (f" (сайт показал {STATS['seen']}, остальные отсеяны: нет слов "
+                            f"запроса в названии/описании, длинные или повторы)")
+                self.bus.log.emit(f"{SOURCE_NAMES[key]}: найдено {len(items)}{note}")
                 found += items
             self.bus.results.emit(found)
         self.run_bg("Поиск", fn)
