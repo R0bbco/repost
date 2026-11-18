@@ -32,7 +32,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 # deno (нужен yt-dlp для YouTube) ставится рядом с python.exe — добавляем в PATH
 os.environ["PATH"] = os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", "")
 
-VERSION = "1.7"
+VERSION = "1.8"
 APP_FILES = ["repost_app.py", "README.md", "requirements.txt", "start.bat"]
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "RepostApp"
@@ -50,11 +50,24 @@ SOURCE_NAMES = dict(SOURCES) | {"link": "Ссылка", "file": "Файл"}
 VIDEO_EXT = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RepostApp/1.0"
 
+JUNK_WORDS = ("подборка, подборки, компиляция, нарезка, сборник, лучшие приколы, топ 10, топ-10, "
+              "озвучка, перезалив, попробуй не засмеяться, засмеялся проиграл, "
+              "try not to laugh, compilation, best of, top 10, funniest moments, reupload")
+PERIODS = [("за всё время", 0), ("за сутки", 86400), ("за неделю", 7 * 86400),
+           ("за месяц", 30 * 86400), ("за год", 365 * 86400)]
+LANGS = [("любой", ""), ("русский", "ru"), ("английский", "en")]
+SORTS = [("как выдал сайт", ""), ("по просмотрам", "views"), ("сначала новые", "date")]
+# хэштеги, по которым «похожие» искать бессмысленно
+GENERIC_TAGS = {"shorts", "short", "fyp", "foryou", "foryoupage", "viral", "рек", "рекомендации",
+                "реки", "trend", "trending", "тренд", "тренды", "reels", "reel", "tiktok",
+                "youtube", "video", "видео", "хочуврек", "врек", "fy", "explore", "xyzbca"}
+
 DEFAULTS = {
     "proxy": "", "show_browser": True, "add_credit": True, "pause_sec": 20,
     "vk_logged": False, "vk_groups": "", "vk_manual_publish": False,
     "out_dir": str(Path.home() / "Videos" / "Repost"),
-    "volume": 70, "work_dir": "", "update_repo": "", "auto_update": True,
+    "volume": 70, "themes": {}, "junk_words": JUNK_WORDS, "watch_authors": "",
+    "work_dir": "", "update_repo": "", "auto_update": True,
     "yt_client_secret": "", "yt_channels": [],
 }
 
@@ -120,6 +133,16 @@ class Posted:
         with sqlite3.connect(self.path) as db:
             db.execute("CREATE TABLE IF NOT EXISTS posted (item TEXT, dest TEXT, "
                        "remote TEXT, at INTEGER, PRIMARY KEY (item, dest))")
+            db.execute("CREATE TABLE IF NOT EXISTS seen (item TEXT PRIMARY KEY, at INTEGER)")
+
+    def seen_has(self, item: str) -> bool:
+        with sqlite3.connect(self.path) as db:
+            return db.execute("SELECT 1 FROM seen WHERE item=?", (item,)).fetchone() is not None
+
+    def seen_add(self, items: list[str]) -> None:
+        with sqlite3.connect(self.path) as db:
+            db.executemany("INSERT OR IGNORE INTO seen VALUES (?,?)",
+                           [(i, int(time.time())) for i in items])
 
     def has(self, item: str, dest: str) -> bool:
         with sqlite3.connect(self.path) as db:
@@ -234,6 +257,8 @@ def ydl_opts(st: dict) -> dict:
         opts["ffmpeg_location"] = imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         pass
+    # примерная дата у роликов в поиске («3 дня назад»)
+    opts["extractor_args"] = {"youtubetab": {"approximate_date": [""]}}
     return opts
 
 
@@ -254,6 +279,117 @@ def text_match(item: dict, stems: list[str]) -> bool:
 STATS = {"seen": 0}      # сколько роликов сайт отдал в последнем поиске (до отсева)
 
 
+def lang_of(text: str) -> str:
+    cyr = len(re.findall(r"[а-яё]", text.casefold()))
+    lat = len(re.findall(r"[a-z]", text.casefold()))
+    if cyr >= 3 and cyr >= lat * 0.5:
+        return "ru"
+    if lat >= 3 and cyr == 0:
+        return "en"
+    return ""
+
+
+def word_list(text: str) -> list[str]:
+    return [w.strip().casefold() for w in re.split(r"[,\n;]+", text or "") if w.strip()]
+
+
+def make_filter(f: dict, q: str, key: str, posted=None):
+    """Собирает проверку ролика из настроек фильтров. None — пропускать всё."""
+    stems = query_stems(q)
+    words = (f.get("strict") and not q.startswith("@") and stems
+             and not (q.startswith("#") and key in ("youtube", "shorts", "tiktok", "instagram")))
+    minus, junk = f.get("minus") or [], f.get("junk") or []
+    min_views, period, lang = f.get("min_views") or 0, f.get("period") or 0, f.get("lang") or ""
+    short, hide = f.get("short"), f.get("hide_posted") and posted is not None
+    if not any((words, minus, junk, min_views, period, lang, short, hide, f.get("sort"))):
+        return None
+    now = time.time()
+
+    def check(i: dict, use_words: bool) -> bool:
+        text = f"{i.get('title') or ''} {i.get('desc') or ''}".casefold()
+        if short and i.get("duration") and i["duration"] > 180:
+            return False
+        if use_words and words and not all(x in text for x in stems):
+            return False
+        if minus and any(x in f"{text} {(i.get('author') or '').casefold()}" for x in minus):
+            return False
+        if junk and any(x in text for x in junk):
+            return False
+        if min_views and i.get("views") is not None and i["views"] < min_views:
+            return False
+        if period and i.get("date") and now - i["date"] > period:
+            return False
+        if lang and lang_of(text) != lang:
+            return False
+        if hide and posted.any(f"{i['source']}:{i['id']}"):
+            return False
+        return True
+
+    def ok(i: dict) -> bool:
+        return check(i, True)
+    ok.loose = lambda i: check(i, False)     # то же, но без проверки слов запроса
+    ok.yt = {"period": period, "sort": f.get("sort") or "", "short": bool(short)}
+    return ok
+
+
+def similar_queries(item: dict) -> list[str]:
+    """Запросы для «похожих»: хэштеги ролика (без общих), иначе главные слова названия."""
+    text = f"{item.get('title') or ''} {item.get('desc') or ''}"
+    tags = []
+    for t in re.findall(r"#(\w+)", text):
+        t = t.casefold()
+        if t not in GENERIC_TAGS and t not in tags and not t.isdigit():
+            tags.append(t)
+    out = [f"#{t}" for t in tags[:3]]
+    if not out:
+        words = [w for w in re.findall(r"[^\W\d_]{4,}", re.sub(r"#\w+|@\w+", " ", text))]
+        words = sorted(dict.fromkeys(w.casefold() for w in words), key=len, reverse=True)
+        if words:
+            out = [" ".join(words[:2])]
+    return out
+
+
+def parse_author(line: str) -> tuple[str, str] | None:
+    """Строка из списка слежки → (источник, "@имя")."""
+    line = line.strip()
+    if not line or line.startswith("//"):
+        return None
+    m = re.search(r"tiktok\.com/@([\w.\-]+)", line)
+    if m:
+        return "tiktok", "@" + m.group(1)
+    m = re.search(r"youtube\.com/@([\w.\-]+)", line)
+    if m:
+        return "youtube", "@" + m.group(1)
+    m = re.search(r"instagram\.com/([\w.]+)", line)
+    if m and m.group(1) not in ("p", "reel", "reels", "explore", "stories"):
+        return "instagram", "@" + m.group(1)
+    m = re.match(r"(tiktok|tt|youtube|yt|shorts|instagram|ig|insta)\s+@?([\w.\-]+)$", line, re.I)
+    if m:
+        src = {"tt": "tiktok", "yt": "youtube", "ig": "instagram", "insta": "instagram"}.get(
+            m.group(1).lower(), m.group(1).lower())
+        return src, "@" + m.group(2)
+    return None
+
+
+def fmt_ago(ts) -> str:
+    if not ts:
+        return ""
+    d = max(0, time.time() - ts)
+    for size, name in ((31536000, "г."), (2592000, "мес."), (86400, "дн."), (3600, "ч")):
+        if d >= size:
+            return f"{int(d // size)} {name}"
+    return "только что"
+
+
+def yt_sp(period: int, by_views: bool, short: bool) -> str:
+    """Параметр sp для страницы поиска YouTube (фильтры: дата, длина, сортировка)."""
+    import base64
+    date = {86400: 2, 7 * 86400: 3, 30 * 86400: 4, 365 * 86400: 5}.get(period, 0)
+    flt = b"\x10\x01" + (bytes([8, date]) if date else b"") + (b"\x18\x01" if short else b"")
+    raw = (b"\x08\x03" if by_views else b"") + bytes([0x12, len(flt)]) + flt
+    return base64.b64encode(raw).decode()
+
+
 def _cut(items: list[dict], n: int, ok) -> list[dict]:
     STATS["seen"] = len(items)
     return [i for i in items if ok is None or ok(i)][:n]
@@ -271,20 +407,37 @@ def _yt_flat(st: dict, url: str, m: int, author: str = "") -> list[dict]:
                     "url": e.get("url") or f"https://www.youtube.com/watch?v={e['id']}",
                     "author": e.get("channel") or e.get("uploader") or author,
                     "title": e.get("title") or "", "desc": e.get("description") or "",
-                    "duration": _int(e.get("duration")), "views": _int(e.get("view_count"))})
+                    "duration": _int(e.get("duration")), "views": _int(e.get("view_count")),
+                    "date": _int(e.get("timestamp") or e.get("release_timestamp")),
+                    "channel_url": e.get("channel_url") or ""})
     return out
+
+
+def yt_words(st: dict, q: str, m: int, opts: dict | None) -> list[dict]:
+    """Поиск YouTube по словам; с фильтрами даты/сортировки — через страницу поиска."""
+    opts = opts or {}
+    if opts.get("period") or opts.get("sort") == "views":
+        sp = yt_sp(opts.get("period") or 0, opts.get("sort") == "views", bool(opts.get("short")))
+        try:
+            res = _yt_flat(st, "https://www.youtube.com/results?search_query="
+                           f"{quote(q)}&sp={quote(sp)}", m)
+            if res:
+                return res
+        except Exception:
+            pass
+    return _yt_flat(st, f"ytsearch{m}:{q}", m)
 
 
 def search_shorts(st: dict, q: str, n: int, ok=None) -> list[dict]:
     """Только YouTube Shorts: по хэштегу, по автору или по словам."""
     m = min(max(n * 5, 40), 300)
     if q.startswith("@"):
-        return _cut(_yt_flat(st, f"https://www.youtube.com/{q}/shorts", n, q[1:]), n, None)
+        return _cut(_yt_flat(st, f"https://www.youtube.com/{q}/shorts", m, q[1:]), n, ok)
     if q.startswith("#"):
-        return _cut(_yt_flat(st, f"https://www.youtube.com/hashtag/{quote(q[1:])}/shorts", n),
-                    n, None)
+        return _cut(_yt_flat(st, f"https://www.youtube.com/hashtag/{quote(q[1:])}/shorts", m),
+                    n, ok)
     # обычный поиск YouTube с пометкой #shorts; Shorts не бывают длиннее 3 минут
-    found = [i for i in _yt_flat(st, f"ytsearch{m}:{q} #shorts", m)
+    found = [i for i in yt_words(st, f"{q} #shorts", m, getattr(ok, "yt", None))
              if i["duration"] and i["duration"] <= 180]
     seen = len(found)
     out = [i for i in found if ok is None or ok(i)][:n]
@@ -293,7 +446,9 @@ def search_shorts(st: dict, q: str, n: int, ok=None) -> list[dict]:
             have = {i["id"] for i in out}
             extra = _yt_flat(st, f"https://www.youtube.com/hashtag/{quote(q)}/shorts", n * 2)
             seen += len(extra)
-            out += [i for i in extra if i["id"] not in have][:n - len(out)]
+            loose = getattr(ok, "loose", None)
+            out += [i for i in extra if i["id"] not in have
+                    and (loose is None or loose(i))][:n - len(out)]
         except Exception:
             pass
     for i in out:
@@ -303,34 +458,19 @@ def search_shorts(st: dict, q: str, n: int, ok=None) -> list[dict]:
 
 
 def search_youtube(st: dict, q: str, n: int, ok=None) -> list[dict]:
-    import yt_dlp
     m = n if ok is None else min(max(n * 5, 30), 300)     # с запасом: часть отсеется
     if q.startswith("@"):
-        urls = [f"https://www.youtube.com/{q}/shorts", f"https://www.youtube.com/{q}/videos"]
-    elif q.startswith("#"):
-        urls = [f"https://www.youtube.com/hashtag/{quote(q[1:])}"]
-    else:
-        urls = [f"ytsearch{m}:{q}"]
-    out, err = [], None
-    for url in urls:
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts(st) | {"extract_flat": True, "playlistend": m}) as ydl:
-                info = ydl.extract_info(url, download=False)
-        except Exception as e:
-            err = e
-            continue
-        for e in (info.get("entries") or [])[:m]:
-            if not e or not e.get("id"):
-                continue
-            out.append({"source": "youtube", "id": e["id"],
-                        "url": e.get("url") or f"https://www.youtube.com/watch?v={e['id']}",
-                        "author": e.get("channel") or e.get("uploader") or q.lstrip("@"),
-                        "title": e.get("title") or "", "desc": e.get("description") or "",
-                        "duration": _int(e.get("duration")),
-                        "views": _int(e.get("view_count"))})
-    if not out and err:
-        raise err
-    return _cut(out, n, ok)
+        out = []
+        for tab in ("shorts", "videos"):
+            try:
+                out += _yt_flat(st, f"https://www.youtube.com/{q}/{tab}", m, q[1:])
+            except Exception:
+                if tab == "videos" and not out:
+                    raise
+        return _cut(out, n, ok)
+    if q.startswith("#"):
+        return _cut(_yt_flat(st, f"https://www.youtube.com/hashtag/{quote(q[1:])}", m), n, ok)
+    return _cut(yt_words(st, q, m, getattr(ok, "yt", None)), n, ok)
 
 
 def parse_vk(data, found: dict) -> None:
@@ -351,7 +491,7 @@ def parse_vk(data, found: dict) -> None:
             "source": "vk", "id": f"{owner}_{vid}",
             "url": f"https://vk.com/video{owner}_{vid}",
             "author": names.get(owner, str(owner)), "title": str(d.get("title") or ""),
-            "desc": str(d.get("description") or ""),
+            "desc": str(d.get("description") or ""), "date": _int(d.get("date")),
             "duration": _int(d.get("duration")),
             "views": _int(views.get("count") if isinstance(views, dict) else views)}
 
@@ -373,7 +513,7 @@ def parse_reddit(data: dict) -> list[dict]:
         out.append({"source": "reddit", "id": p.get("id", ""),
                     "url": "https://www.reddit.com" + p.get("permalink", ""),
                     "author": p.get("author") or "", "title": p.get("title") or "",
-                    "desc": p.get("selftext") or "",
+                    "desc": p.get("selftext") or "", "date": _int(p.get("created_utc")),
                     "duration": _int(rv.get("duration")), "views": _int(p.get("score"))})
     return out
 
@@ -385,7 +525,12 @@ def search_reddit(st: dict, q: str, n: int, ok=None) -> list[dict]:
     for _ in range(5):                       # до 5 страниц по 100 постов
         r = requests.get("https://www.reddit.com/search.json",
                          params={"q": q.lstrip("#"), "limit": 100, "type": "link",
-                                 "sort": "relevance", "raw_json": 1, "after": after},
+                                 "sort": "top" if (getattr(ok, "yt", None) or {}).get("sort")
+                                 == "views" else "relevance",
+                                 "t": {86400: "day", 7 * 86400: "week", 30 * 86400: "month",
+                                       365 * 86400: "year"}.get(
+                                     (getattr(ok, "yt", None) or {}).get("period"), "all"),
+                                 "raw_json": 1, "after": after},
                          headers={"User-Agent": UA}, proxies=proxies(st), timeout=30)
         if r.status_code in (403, 429):
             raise RuntimeError(f"Reddit отказал (код {r.status_code}) — попробуй позже или с VPN")
@@ -412,6 +557,7 @@ def parse_tiktok(data: dict, found: dict) -> None:
         found[vid] = {"source": "tiktok", "id": vid,
                       "url": f"https://www.tiktok.com/@{user}/video/{vid}",
                       "author": user, "title": (it.get("desc") or "").strip(),
+                      "date": _int(it.get("createTime")),
                       "duration": _int((it.get("video") or {}).get("duration")),
                       "views": _int(stats.get("playCount"))}
 
@@ -441,6 +587,8 @@ def parse_instagram(data, found: dict) -> None:
                                  or old.get("author") or "",
                        "title": (text or "").strip() or old.get("title") or "",
                        "duration": _int(d.get("video_duration")) or old.get("duration"),
+                       "date": _int(d.get("taken_at") or d.get("taken_at_timestamp"))
+                               or old.get("date"),
                        "views": _int(views) or old.get("views")}
 
 
@@ -975,10 +1123,11 @@ class Bus(QtCore.QObject):
     preview = QtCore.Signal(str, str)        # (источник: "url" | "file" | "error", значение)
     update_found = QtCore.Signal(str)
     added = QtCore.Signal(list)
+    more = QtCore.Signal(list)               # дописать в список без отметок
 
 
 class Main(QtWidgets.QMainWindow):
-    COLS = ["", "Источник", "Автор", "Название", "Длина", "Просмотры", "Статус"]
+    COLS = ["", "Источник", "Автор", "Название", "Длина", "Просмотры", "Когда", "Статус"]
 
     def __init__(self):
         super().__init__()
@@ -995,6 +1144,7 @@ class Main(QtWidgets.QMainWindow):
         self.bus.preview.connect(self.on_preview)
         self.bus.update_found.connect(self.on_update_found)
         self.bus.added.connect(self.add_items)
+        self.bus.more.connect(self.add_items_unmarked)
         self.preview_item: dict | None = None
         self.preview_tmp: Path | None = None
 
@@ -1019,37 +1169,92 @@ class Main(QtWidgets.QMainWindow):
     def build_main_tab(self) -> QtWidgets.QWidget:
         left = QtWidgets.QGroupBox("1. Где и что искать")
         lv = QtWidgets.QVBoxLayout(left)
+        lv.addWidget(QtWidgets.QLabel("Тема:"))
+        row = QtWidgets.QHBoxLayout()
+        self.theme_box = QtWidgets.QComboBox()
+        self.theme_box.setToolTip("Сохранённый набор запросов и фильтров. Выбери — и форма заполнится")
+        self.theme_box.activated.connect(self.load_theme)
+        row.addWidget(self.theme_box, 1)
+        lv.addLayout(row)
+        row = QtWidgets.QHBoxLayout()
+        for text, fn in (("Сохранить тему", self.save_theme), ("Удалить", self.delete_theme)):
+            b = QtWidgets.QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        lv.addLayout(row)
+        lv.addSpacing(6)
         self.src_boxes = {}
         for key, name in SOURCES:
             cb = QtWidgets.QCheckBox(name)
             cb.setChecked(key == "youtube")
             self.src_boxes[key] = cb
             lv.addWidget(cb)
-        lv.addSpacing(8)
-        lv.addWidget(QtWidgets.QLabel("Слова, #хэштег или @автор:"))
-        self.query = QtWidgets.QLineEdit()
-        self.query.setPlaceholderText("#рецепты, смешные коты или @имя_канала")
-        self.query.returnPressed.connect(self.start_search)
+        lv.addSpacing(6)
+        lv.addWidget(QtWidgets.QLabel("Что искать — по запросу в строке\n(слова, #хэштег или @автор):"))
+        self.query = QtWidgets.QPlainTextEdit()
+        self.query.setPlaceholderText("пранки над друзьями\n#котыприколы\n@имя_канала")
+        self.query.setMaximumHeight(72)
         lv.addWidget(self.query)
-        lv.addWidget(QtWidgets.QLabel("Сколько видео с каждого источника:"))
+        lv.addWidget(QtWidgets.QLabel("Минус-слова (через запятую):"))
+        self.minus = QtWidgets.QLineEdit()
+        self.minus.setPlaceholderText("например: мультик, игра, minecraft")
+        self.minus.setToolTip("Ролики с этими словами в названии, описании или имени автора "
+                              "не попадут в список")
+        lv.addWidget(self.minus)
+
+        flt = QtWidgets.QGroupBox("Фильтры")
+        fl = QtWidgets.QFormLayout(flt)
+        fl.setContentsMargins(6, 6, 6, 6)
         self.count = QtWidgets.QSpinBox()
         self.count.setRange(5, 200)
         self.count.setValue(20)
-        lv.addWidget(self.count)
+        fl.addRow("Видео с источника:", self.count)
+        self.min_views = QtWidgets.QSpinBox()
+        self.min_views.setRange(0, 100_000_000)
+        self.min_views.setSingleStep(10_000)
+        self.min_views.setSpecialValueText("любые")
+        self.min_views.setGroupSeparatorShown(True)
+        fl.addRow("Просмотров от:", self.min_views)
+        self.period = QtWidgets.QComboBox()
+        for name, _ in PERIODS:
+            self.period.addItem(name)
+        fl.addRow("Когда вышло:", self.period)
+        self.lang = QtWidgets.QComboBox()
+        for name, _ in LANGS:
+            self.lang.addItem(name)
+        self.lang.setToolTip("Определяется по тексту названия и описания")
+        fl.addRow("Язык текста:", self.lang)
+        self.sort = QtWidgets.QComboBox()
+        for name, _ in SORTS:
+            self.sort.addItem(name)
+        fl.addRow("Порядок:", self.sort)
         self.only_short = QtWidgets.QCheckBox("Только короткие (до 3 минут)")
         self.only_short.setChecked(True)
-        lv.addWidget(self.only_short)
+        fl.addRow(self.only_short)
         self.strict = QtWidgets.QCheckBox("Слова должны быть в названии\nили описании ролика")
         self.strict.setChecked(True)
         self.strict.setToolTip("Отсеивает ролики, которые нашлись только по имени канала.\n"
                                "Если находит слишком мало — сними галочку.")
-        lv.addWidget(self.strict)
+        fl.addRow(self.strict)
+        self.no_junk = QtWidgets.QCheckBox("Без подборок, нарезок, озвучек")
+        self.no_junk.setChecked(True)
+        self.no_junk.setToolTip("Список таких слов — на вкладке «Аккаунты и настройки»")
+        fl.addRow(self.no_junk)
+        self.hide_posted = QtWidgets.QCheckBox("Скрывать то, что уже заливал")
+        self.hide_posted.setChecked(True)
+        fl.addRow(self.hide_posted)
+        lv.addWidget(flt)
+
         self.btn_search = QtWidgets.QPushButton("Найти")
         self.btn_search.clicked.connect(self.start_search)
         lv.addWidget(self.btn_search)
-        lv.addSpacing(14)
-        lab = QtWidgets.QLabel("Или добавить без поиска:")
-        lv.addWidget(lab)
+        b = QtWidgets.QPushButton("Новые у моих авторов")
+        b.setToolTip("Проверяет авторов из списка на вкладке «Аккаунты и настройки»\n"
+                     "и показывает ролики, которых ты ещё не видел")
+        b.clicked.connect(self.check_authors)
+        lv.addWidget(b)
+        lv.addSpacing(10)
+        lv.addWidget(QtWidgets.QLabel("Или добавить без поиска:"))
         b = QtWidgets.QPushButton("Вставить ссылки…")
         b.setToolTip("Ссылки на ролики из Instagram, TikTok, YouTube, ВК, Reddit и других сайтов")
         b.clicked.connect(self.add_links)
@@ -1060,6 +1265,11 @@ class Main(QtWidgets.QMainWindow):
         self.keep_list = QtWidgets.QCheckBox("Новый поиск не очищает список")
         lv.addWidget(self.keep_list)
         lv.addStretch(1)
+        left_scroll = QtWidgets.QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        left_scroll.setWidget(left)
+        self.refresh_themes()
 
         mid = QtWidgets.QGroupBox("2. Найденные видео — отметь нужные")
         mv = QtWidgets.QVBoxLayout(mid)
@@ -1098,10 +1308,10 @@ class Main(QtWidgets.QMainWindow):
         rv.addWidget(self.btn_upload)
 
         split = QtWidgets.QSplitter()
-        for w in (left, mid, right):
+        for w in (left_scroll, mid, right):
             split.addWidget(w)
         split.setStretchFactor(1, 1)
-        split.setSizes([230, 760, 270])
+        split.setSizes([280, 720, 260])
 
         self.log_box = QtWidgets.QPlainTextEdit()
         self.log_box.setReadOnly(True)
@@ -1148,7 +1358,8 @@ class Main(QtWidgets.QMainWindow):
         side.addWidget(self.preview_title)
         for text, fn in (("▶ / ❚❚", self.toggle_play), ("Звук вкл/выкл", self.toggle_mute),
                          ("Открыть в браузере", self.open_in_browser),
-                         ("Отметить для заливки", self.check_previewed)):
+                         ("Отметить для заливки", self.check_previewed),
+                         ("Найти похожие", self.find_similar)):
             b = QtWidgets.QPushButton(text)
             b.clicked.connect(fn)
             side.addWidget(b)
@@ -1318,6 +1529,23 @@ class Main(QtWidgets.QMainWindow):
         row.addWidget(self.yt_status, 1)
         lay.addLayout(row)
 
+        lay = box("Мои авторы — для кнопки «Новые у моих авторов»",
+                  "Ссылки на страницы авторов, по одной в строке: партнёры, любимые каналы. "
+                  "Подходят ссылки вида https://www.tiktok.com/@имя, https://www.youtube.com/@имя, "
+                  "https://www.instagram.com/имя. Кнопка покажет только ролики, которых ты ещё не "
+                  "видел (при первой проверке новыми считаются все).")
+        self.watch_authors = QtWidgets.QPlainTextEdit(self.st["watch_authors"])
+        self.watch_authors.setPlaceholderText("https://www.tiktok.com/@имя\nhttps://www.youtube.com/@имя")
+        self.watch_authors.setMaximumHeight(90)
+        lay.addWidget(self.watch_authors)
+
+        lay = box("Слова подборок и нарезок",
+                  "Ролики с этими словами отсеиваются, когда стоит галочка «Без подборок, нарезок, "
+                  "озвучек». Через запятую, можно дописывать свои.")
+        self.junk_words = QtWidgets.QPlainTextEdit(self.st["junk_words"])
+        self.junk_words.setMaximumHeight(70)
+        lay.addWidget(self.junk_words)
+
         lay = box("TikTok, Instagram, Reddit — только поиск",
                   "Откроется окно браузера: войди в аккаунт как обычно и закрой окно — приложение "
                   "запомнит вход. TikTok по хэштегам часто работает и без входа. "
@@ -1410,7 +1638,9 @@ class Main(QtWidgets.QMainWindow):
                        vk_manual_publish=self.vk_manual.isChecked(),
                        show_browser=self.show_browser.isChecked(), pause_sec=self.pause.value(),
                        add_credit=self.credit.isChecked(),
-                       update_repo=self.update_repo.text().strip())
+                       update_repo=self.update_repo.text().strip(),
+                       watch_authors=self.watch_authors.toPlainText(),
+                       junk_words=self.junk_words.toPlainText())
         save_settings(self.st)
         self.refresh_accounts()
 
@@ -1589,49 +1819,164 @@ class Main(QtWidgets.QMainWindow):
         self.run_bg(f"Вход в {name}", fn)
 
     # ---------- поиск
-    def start_search(self) -> None:
-        q = self.query.text().strip()
-        chosen = [k for k, cb in self.src_boxes.items() if cb.isChecked()]
-        if not q or not chosen:
-            self.log("Впиши запрос и отметь хотя бы один источник.")
+    def form_filters(self) -> dict:
+        return {"short": self.only_short.isChecked(), "strict": self.strict.isChecked(),
+                "minus": word_list(self.minus.text()),
+                "junk": word_list(self.st.get("junk_words", "")) if self.no_junk.isChecked() else [],
+                "min_views": self.min_views.value(), "period": PERIODS[self.period.currentIndex()][1],
+                "lang": LANGS[self.lang.currentIndex()][1], "sort": SORTS[self.sort.currentIndex()][1],
+                "hide_posted": self.hide_posted.isChecked()}
+
+    def get_form(self) -> dict:
+        return {"sources": [k for k, cb in self.src_boxes.items() if cb.isChecked()],
+                "queries": self.query.toPlainText(), "minus": self.minus.text(),
+                "count": self.count.value(), "min_views": self.min_views.value(),
+                "period": self.period.currentIndex(), "lang": self.lang.currentIndex(),
+                "sort": self.sort.currentIndex(), "short": self.only_short.isChecked(),
+                "strict": self.strict.isChecked(), "no_junk": self.no_junk.isChecked(),
+                "hide_posted": self.hide_posted.isChecked()}
+
+    def set_form(self, f: dict) -> None:
+        for k, cb in self.src_boxes.items():
+            cb.setChecked(k in f.get("sources", []))
+        self.query.setPlainText(f.get("queries", ""))
+        self.minus.setText(f.get("minus", ""))
+        self.count.setValue(int(f.get("count", 20)))
+        self.min_views.setValue(int(f.get("min_views", 0)))
+        for box, key in ((self.period, "period"), (self.lang, "lang"), (self.sort, "sort")):
+            box.setCurrentIndex(min(int(f.get(key, 0)), box.count() - 1))
+        self.only_short.setChecked(f.get("short", True))
+        self.strict.setChecked(f.get("strict", True))
+        self.no_junk.setChecked(f.get("no_junk", True))
+        self.hide_posted.setChecked(f.get("hide_posted", True))
+
+    def refresh_themes(self, current: str = "") -> None:
+        self.theme_box.clear()
+        self.theme_box.addItem("— без темы —")
+        for name in sorted(self.st["themes"]):
+            self.theme_box.addItem(name)
+        if current:
+            self.theme_box.setCurrentText(current)
+
+    def load_theme(self, idx: int) -> None:
+        name = self.theme_box.currentText()
+        if idx > 0 and name in self.st["themes"]:
+            self.set_form(self.st["themes"][name])
+            self.log(f"Тема «{name}» загружена — нажми «Найти».")
+
+    def save_theme(self) -> None:
+        cur = self.theme_box.currentText() if self.theme_box.currentIndex() > 0 else ""
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Сохранить тему", "Название темы (например «Пранки» или «Животные»):", text=cur)
+        name = (name or "").strip()
+        if not ok or not name:
             return
-        n, short = self.count.value(), self.only_short.isChecked()
-        strict, stems = self.strict.isChecked(), query_stems(q)
-        by_author = q.startswith("@")
+        self.st["themes"][name] = self.get_form()
+        save_settings(self.st)
+        self.refresh_themes(name)
+        self.log(f"Тема «{name}» сохранена.")
 
-        def make_ok(key):
-            """Проверка ролика: длина и слова запроса в названии/описании."""
-            words = (strict and not by_author and stems
-                     and not (q.startswith("#") and key in ("youtube", "shorts", "tiktok",
-                                                            "instagram")))
-            if not short and not words:
-                return None
-            return lambda i: ((not short or not i["duration"] or i["duration"] <= 180)
-                              and (not words or text_match(i, stems)))
+    def delete_theme(self) -> None:
+        name = self.theme_box.currentText()
+        if self.theme_box.currentIndex() <= 0:
+            return
+        if QtWidgets.QMessageBox.question(self, "Удалить тему", f"Удалить тему «{name}»?") \
+                != QtWidgets.QMessageBox.Yes:
+            return
+        self.st["themes"].pop(name, None)
+        save_settings(self.st)
+        self.refresh_themes()
 
+    def run_search(self, jobs: list[tuple[str, str]], n: int, f: dict, mode: str = "results",
+                   only_new: bool = False) -> None:
+        """jobs — пары (источник, запрос). mode: results — заменить список, more — дописать."""
         def fn():
             found, seen = [], set()
-            for key in chosen:
-                self.bus.log.emit(f"Ищу в {SOURCE_NAMES[key]}: {q}")
+            for key, q in jobs:
+                name = SOURCE_NAMES[key]
+                self.bus.log.emit(f"Ищу в {name}: {q}")
+                ok = make_filter(f, q, key, self.posted)
                 try:
-                    items = SEARCHERS[key](self.st, q, n, make_ok(key))
+                    items = SEARCHERS[key](self.st, q, n, ok)
                 except Exception as e:
                     msg = str(e)
                     if "has been closed" in msg:
                         msg = ("окно браузера закрылось раньше времени. Не закрывай его, пока "
                                "идёт поиск — оно закроется само")
-                    self.bus.log.emit(f"{SOURCE_NAMES[key]}: не получилось — {msg}")
+                    self.bus.log.emit(f"{name}: не получилось — {msg}")
                     continue
                 items = [i for i in items if (i["source"], i["id"]) not in seen]
                 seen |= {(i["source"], i["id"]) for i in items}
+                if only_new:
+                    keys = [f"{i['source']}:{i['id']}" for i in items]
+                    new = [i for i, k in zip(items, keys) if not self.posted.seen_has(k)]
+                    self.posted.seen_add(keys)
+                    self.bus.log.emit(f"{name} {q}: новых {len(new)} из {len(items)}")
+                    found += new
+                    continue
                 note = ""
                 if STATS["seen"] > len(items) and len(items) < n:
-                    note = (f" (сайт показал {STATS['seen']}, остальные отсеяны: нет слов "
-                            f"запроса в названии/описании, длинные или повторы)")
-                self.bus.log.emit(f"{SOURCE_NAMES[key]}: найдено {len(items)}{note}")
+                    note = (f" (сайт показал {STATS['seen']}, остальные отсеяны фильтрами "
+                            f"или повторы)")
+                self.bus.log.emit(f"{name}: найдено {len(items)}{note}")
                 found += items
-            self.bus.results.emit(found)
+            if f.get("sort") == "views":
+                found.sort(key=lambda i: i.get("views") or -1, reverse=True)
+            elif f.get("sort") == "date":
+                found.sort(key=lambda i: i.get("date") or 0, reverse=True)
+            (self.bus.more if mode == "more" else self.bus.results).emit(found)
         self.run_bg("Поиск", fn)
+
+    def start_search(self) -> None:
+        queries = [q.strip() for q in self.query.toPlainText().splitlines() if q.strip()]
+        chosen = [k for k, cb in self.src_boxes.items() if cb.isChecked()]
+        if not queries or not chosen:
+            self.log("Впиши запрос и отметь хотя бы один источник.")
+            return
+        self.run_search([(k, q) for q in queries for k in chosen], self.count.value(),
+                        self.form_filters())
+
+    def find_similar(self) -> None:
+        it = self.preview_item
+        row = self.table.currentRow()
+        if it is None and 0 <= row < len(self.items):
+            it = self.items[row]
+        if it is None:
+            self.log("Сначала выбери ролик в списке (щелчок по строке).")
+            return
+        src = it["source"]
+        if src == "youtube":
+            src = "shorts" if (it.get("duration") or 0) <= 180 else "youtube"
+        if src not in SEARCHERS:
+            self.log("Для файлов и ссылок с других сайтов «похожие» искать негде.")
+            return
+        qs = similar_queries(it)
+        if src in ("tiktok", "instagram") and it.get("author"):
+            qs.append("@" + it["author"].lstrip("@"))
+        if not qs:
+            self.log("У этого ролика нет хэштегов и понятных слов — не по чему искать похожие.")
+            return
+        self.log(f"Ищу похожие по: {', '.join(qs)}")
+        f = self.form_filters() | {"strict": False}
+        self.run_search([(src, q) for q in qs], self.count.value(), f, mode="more")
+
+    def check_authors(self) -> None:
+        self.save_form()
+        jobs, bad = [], []
+        for line in (self.st.get("watch_authors") or "").splitlines():
+            a = parse_author(line)
+            if a:
+                jobs.append(a)
+            elif line.strip():
+                bad.append(line.strip())
+        for b in bad:
+            self.log(f"Не понял строку в списке авторов: {b}")
+        if not jobs:
+            self.log("Список авторов пуст. Добавь ссылки на авторов на вкладке "
+                     "«Аккаунты и настройки» → «Мои авторы».")
+            return
+        f = self.form_filters() | {"strict": False, "minus": [], "lang": "", "min_views": 0}
+        self.run_search(jobs, self.count.value(), f, only_new=True)
 
     def add_links(self) -> None:
         text, ok = QtWidgets.QInputDialog.getMultiLineText(
@@ -1687,7 +2032,7 @@ class Main(QtWidgets.QMainWindow):
             if it.get("desc") and it["desc"].strip() not in title:
                 title = f"{title} · {it['desc'].strip()[:200]}"
             cells = [SOURCE_NAMES[it["source"]], it["author"], title.replace("\n", " "),
-                     fmt_dur(it["duration"]), fmt_num(it["views"]),
+                     fmt_dur(it["duration"]), fmt_num(it["views"]), fmt_ago(it.get("date")),
                      "уже заливалось" if done else ""]
             for c, text in enumerate(cells, start=1):
                 self.table.setItem(r, c, QtWidgets.QTableWidgetItem(text))
@@ -1707,7 +2052,7 @@ class Main(QtWidgets.QMainWindow):
     def set_row_status(self, key: str, text: str) -> None:
         for r, it in enumerate(self.items):
             if f"{it['source']}:{it['id']}" == key:
-                self.table.item(r, 6).setText(text)
+                self.table.item(r, 7).setText(text)
 
     # ---------- заливка
     def start_upload(self) -> None:
