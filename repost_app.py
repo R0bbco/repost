@@ -32,7 +32,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 # deno (нужен yt-dlp для YouTube) ставится рядом с python.exe — добавляем в PATH
 os.environ["PATH"] = os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", "")
 
-VERSION = "1.8"
+VERSION = "1.9"
 APP_FILES = ["repost_app.py", "README.md", "requirements.txt", "start.bat"]
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "RepostApp"
@@ -66,7 +66,8 @@ DEFAULTS = {
     "proxy": "", "show_browser": True, "add_credit": True, "pause_sec": 20,
     "vk_logged": False, "vk_groups": "", "vk_manual_publish": False,
     "out_dir": str(Path.home() / "Videos" / "Repost"),
-    "volume": 70, "themes": {}, "junk_words": JUNK_WORDS, "watch_authors": "",
+    "volume": 70, "themes": {},
+    "ai_url": "http://localhost:11434", "ai_model": "gemma3:4b", "junk_words": JUNK_WORDS, "watch_authors": "",
     "work_dir": "", "update_repo": "", "auto_update": True,
     "yt_client_secret": "", "yt_channels": [],
 }
@@ -371,6 +372,89 @@ def parse_author(line: str) -> tuple[str, str] | None:
     return None
 
 
+# ================================================================ ИИ-фильтр (Ollama на этом ПК)
+
+AI_SCHEMA = {"type": "object", "properties": {"score": {"type": "integer"},
+                                               "reason": {"type": "string"}},
+             "required": ["score", "reason"]}
+
+
+def _ai_session() -> requests.Session:
+    s = requests.Session()
+    s.trust_env = False                      # к локальному ИИ — без прокси
+    return s
+
+
+def ai_status(st: dict) -> tuple[bool, str]:
+    """(готов ли, что сказать человеку)."""
+    try:
+        r = _ai_session().get(st["ai_url"].rstrip("/") + "/api/tags", timeout=5)
+        r.raise_for_status()
+    except Exception:
+        return False, ("Ollama не отвечает. Установи её с ollama.com и запусти "
+                       "(значок ламы должен быть у часов).")
+    names = [m.get("name", "") for m in r.json().get("models", [])]
+    model = st["ai_model"]
+    if not any(n == model or n.split(":")[0] == model or n == model + ":latest" for n in names):
+        return False, f"Ollama работает, но модели {model} нет — нажми «Скачать модель»."
+    return True, f"ИИ готов: {model}"
+
+
+def ai_pull(st: dict, log) -> None:
+    last = ""
+    with _ai_session().post(st["ai_url"].rstrip("/") + "/api/pull",
+                            json={"model": st["ai_model"]}, stream=True, timeout=3600) as r:
+        r.raise_for_status()
+        for line in r.iter_lines():
+            if not line:
+                continue
+            d = json.loads(line)
+            if d.get("error"):
+                raise RuntimeError(d["error"])
+            msg = d.get("status", "")
+            if d.get("total") and d.get("completed"):
+                pct = int(d["completed"] * 100 / d["total"])
+                msg = f"{msg} {pct}%"
+                if pct % 10:
+                    continue
+            if msg != last:
+                log(f"Модель: {msg}")
+                last = msg
+
+
+def ai_score(st: dict, item: dict, theme: str, with_image: bool) -> tuple[int, str]:
+    """Оценка 0–10: насколько ролик подходит под описание темы."""
+    system = ("Ты помогаешь отбирать короткие видео для канала. Описание того, что нужно "
+              f"каналу:\n«{theme}»\n\nПо данным ролика"
+              f"{' и его обложке' if with_image else ''} оцени, насколько он подходит, "
+              "от 0 до 10. 10 — точно то, что нужно; 5 — сомнительно; 0 — совсем не то. "
+              "Если в описании темы что-то запрещено — за это ставь 0–2. Подборки, нарезки, "
+              "реклама и перезаливы — низкая оценка, если тема не просит иного. "
+              "Ответь JSON: score — целое число, reason — причина по-русски, до 8 слов.")
+    user = (f"Источник: {SOURCE_NAMES.get(item['source'], item['source'])}\n"
+            f"Автор: {item.get('author') or '—'}\n"
+            f"Название: {(item.get('title') or '—')[:400]}\n"
+            f"Описание: {(item.get('desc') or '—')[:600]}\n"
+            f"Длина: {fmt_dur(item.get('duration')) or 'неизвестно'}")
+    msg: dict = {"role": "user", "content": user}
+    if with_image and item.get("thumb"):
+        try:
+            r = requests.get(item["thumb"], headers={"User-Agent": UA, "Referer": item["url"]},
+                             proxies=proxies(st), timeout=15)
+            if r.ok and r.headers.get("content-type", "").startswith("image"):
+                import base64
+                msg["images"] = [base64.b64encode(r.content).decode()]
+        except Exception:
+            pass
+    r = _ai_session().post(st["ai_url"].rstrip("/") + "/api/chat", timeout=300, json={
+        "model": st["ai_model"], "stream": False, "format": AI_SCHEMA, "keep_alive": "15m",
+        "options": {"temperature": 0, "num_ctx": 4096},
+        "messages": [{"role": "system", "content": system}, msg]})
+    r.raise_for_status()
+    d = json.loads(r.json()["message"]["content"])
+    return max(0, min(10, int(d.get("score", 0)))), str(d.get("reason", ""))[:80]
+
+
 def fmt_ago(ts) -> str:
     if not ts:
         return ""
@@ -409,7 +493,8 @@ def _yt_flat(st: dict, url: str, m: int, author: str = "") -> list[dict]:
                     "title": e.get("title") or "", "desc": e.get("description") or "",
                     "duration": _int(e.get("duration")), "views": _int(e.get("view_count")),
                     "date": _int(e.get("timestamp") or e.get("release_timestamp")),
-                    "channel_url": e.get("channel_url") or ""})
+                    "channel_url": e.get("channel_url") or "",
+                    "thumb": f"https://i.ytimg.com/vi/{e['id']}/hqdefault.jpg"})
     return out
 
 
@@ -473,6 +558,14 @@ def search_youtube(st: dict, q: str, n: int, ok=None) -> list[dict]:
     return _cut(yt_words(st, q, m, getattr(ok, "yt", None)), n, ok)
 
 
+def _vk_thumb(d: dict) -> str:
+    imgs = [i for i in (d.get("image") or d.get("first_frame") or []) if isinstance(i, dict)]
+    imgs = [i for i in imgs if i.get("url")]
+    if not imgs:
+        return ""
+    return min(imgs, key=lambda i: abs((i.get("width") or 0) - 480))["url"]
+
+
 def parse_vk(data, found: dict) -> None:
     """Достаёт ролики из ответов сайта VK Видео (формат может меняться — разбор терпимый)."""
     names: dict[int, str] = {}
@@ -493,6 +586,7 @@ def parse_vk(data, found: dict) -> None:
             "author": names.get(owner, str(owner)), "title": str(d.get("title") or ""),
             "desc": str(d.get("description") or ""), "date": _int(d.get("date")),
             "duration": _int(d.get("duration")),
+            "thumb": _vk_thumb(d),
             "views": _int(views.get("count") if isinstance(views, dict) else views)}
 
 
@@ -514,7 +608,10 @@ def parse_reddit(data: dict) -> list[dict]:
                     "url": "https://www.reddit.com" + p.get("permalink", ""),
                     "author": p.get("author") or "", "title": p.get("title") or "",
                     "desc": p.get("selftext") or "", "date": _int(p.get("created_utc")),
-                    "duration": _int(rv.get("duration")), "views": _int(p.get("score"))})
+                    "duration": _int(rv.get("duration")), "views": _int(p.get("score")),
+                    "thumb": str(_find(p.get("preview") or {}, "url") or "")
+                             or (p.get("thumbnail") if str(p.get("thumbnail", "")).startswith("http")
+                                 else "")})
     return out
 
 
@@ -559,7 +656,8 @@ def parse_tiktok(data: dict, found: dict) -> None:
                       "author": user, "title": (it.get("desc") or "").strip(),
                       "date": _int(it.get("createTime")),
                       "duration": _int((it.get("video") or {}).get("duration")),
-                      "views": _int(stats.get("playCount"))}
+                      "views": _int(stats.get("playCount")),
+                      "thumb": (it.get("video") or {}).get("cover") or ""}
 
 
 def parse_instagram(data, found: dict) -> None:
@@ -589,7 +687,10 @@ def parse_instagram(data, found: dict) -> None:
                        "duration": _int(d.get("video_duration")) or old.get("duration"),
                        "date": _int(d.get("taken_at") or d.get("taken_at_timestamp"))
                                or old.get("date"),
-                       "views": _int(views) or old.get("views")}
+                       "views": _int(views) or old.get("views"),
+                       "thumb": str(_find(d.get("image_versions2") or {}, "url")
+                                    or d.get("display_url") or d.get("thumbnail_src")
+                                    or old.get("thumb") or "")}
 
 
 def _browser_search(st: dict, url: str, marks: tuple, parser, n: int, ok=None,
@@ -1124,10 +1225,11 @@ class Bus(QtCore.QObject):
     update_found = QtCore.Signal(str)
     added = QtCore.Signal(list)
     more = QtCore.Signal(list)               # дописать в список без отметок
+    rerank = QtCore.Signal(list)             # тот же список в новом порядке (после ИИ)
 
 
 class Main(QtWidgets.QMainWindow):
-    COLS = ["", "Источник", "Автор", "Название", "Длина", "Просмотры", "Когда", "Статус"]
+    COLS = ["", "Источник", "Автор", "Название", "Длина", "Просмотры", "Когда", "ИИ", "Статус"]
 
     def __init__(self):
         super().__init__()
@@ -1145,6 +1247,7 @@ class Main(QtWidgets.QMainWindow):
         self.bus.update_found.connect(self.on_update_found)
         self.bus.added.connect(self.add_items)
         self.bus.more.connect(self.add_items_unmarked)
+        self.bus.rerank.connect(self.on_rerank)
         self.preview_item: dict | None = None
         self.preview_tmp: Path | None = None
 
@@ -1201,6 +1304,12 @@ class Main(QtWidgets.QMainWindow):
         self.minus.setToolTip("Ролики с этими словами в названии, описании или имени автора "
                               "не попадут в список")
         lv.addWidget(self.minus)
+        lv.addWidget(QtWidgets.QLabel("Что нужно — своими словами (для ИИ):"))
+        self.ai_desc = QtWidgets.QPlainTextEdit()
+        self.ai_desc.setPlaceholderText("например: бытовые пранки над друзьями и роднёй, "
+                                        "живые люди, без животных, мультиков и игр")
+        self.ai_desc.setMaximumHeight(64)
+        lv.addWidget(self.ai_desc)
 
         flt = QtWidgets.QGroupBox("Фильтры")
         fl = QtWidgets.QFormLayout(flt)
@@ -1243,6 +1352,16 @@ class Main(QtWidgets.QMainWindow):
         self.hide_posted = QtWidgets.QCheckBox("Скрывать то, что уже заливал")
         self.hide_posted.setChecked(True)
         fl.addRow(self.hide_posted)
+        self.use_ai = QtWidgets.QCheckBox("Отбор ИИ, оценка от:")
+        self.use_ai.setToolTip("ИИ на твоём компьютере читает каждый найденный ролик и ставит\n"
+                               "оценку 0–10 по описанию «Что нужно». Ниже порога — отсеивается.\n"
+                               "Настройка — на вкладке «Аккаунты и настройки» → «ИИ».")
+        self.ai_min = QtWidgets.QSpinBox()
+        self.ai_min.setRange(0, 10)
+        self.ai_min.setValue(6)
+        fl.addRow(self.use_ai, self.ai_min)
+        self.ai_image = QtWidgets.QCheckBox("ИИ смотрит и обложку (медленнее)")
+        fl.addRow(self.ai_image)
         lv.addWidget(flt)
 
         self.btn_search = QtWidgets.QPushButton("Найти")
@@ -1286,7 +1405,8 @@ class Main(QtWidgets.QMainWindow):
         mv.addWidget(self.build_player(), 2)
         row = QtWidgets.QHBoxLayout()
         for text, fn in (("Отметить все", lambda: self.check_all(True)),
-                         ("Снять отметки", lambda: self.check_all(False))):
+                         ("Снять отметки", lambda: self.check_all(False)),
+                         ("Оценить список ИИ", self.rate_list)):
             b = QtWidgets.QPushButton(text)
             b.clicked.connect(fn)
             row.addWidget(b)
@@ -1539,6 +1659,27 @@ class Main(QtWidgets.QMainWindow):
         self.watch_authors.setMaximumHeight(90)
         lay.addWidget(self.watch_authors)
 
+        lay = box("ИИ на этом компьютере — для отбора роликов",
+                  "Бесплатно и без интернета для самого ИИ. 1) Скачай Ollama с ollama.com "
+                  "(кнопка Download → Windows) и установи. 2) Нажми «Скачать модель» — это "
+                  "около 3 ГБ, один раз. 3) Нажми «Проверить ИИ». Потом на первой вкладке опиши "
+                  "в поле «Что нужно», какие ролики тебе нужны, и поставь галочку «Отбор ИИ».")
+        form = QtWidgets.QFormLayout()
+        self.ai_url = QtWidgets.QLineEdit(self.st["ai_url"])
+        form.addRow("Адрес Ollama:", self.ai_url)
+        self.ai_model = QtWidgets.QLineEdit(self.st["ai_model"])
+        self.ai_model.setToolTip("gemma3:4b — быстрая, понимает картинки. Точнее, но медленнее: "
+                                 "gemma3:12b (около 8 ГБ)")
+        form.addRow("Модель:", self.ai_model)
+        lay.addLayout(form)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(button("Проверить ИИ", self.do_ai_check))
+        row.addWidget(button("Скачать модель", self.do_ai_pull))
+        self.ai_state = QtWidgets.QLabel()
+        self.ai_state.setWordWrap(True)
+        row.addWidget(self.ai_state, 1)
+        lay.addLayout(row)
+
         lay = box("Слова подборок и нарезок",
                   "Ролики с этими словами отсеиваются, когда стоит галочка «Без подборок, нарезок, "
                   "озвучек». Через запятую, можно дописывать свои.")
@@ -1640,7 +1781,9 @@ class Main(QtWidgets.QMainWindow):
                        add_credit=self.credit.isChecked(),
                        update_repo=self.update_repo.text().strip(),
                        watch_authors=self.watch_authors.toPlainText(),
-                       junk_words=self.junk_words.toPlainText())
+                       junk_words=self.junk_words.toPlainText(),
+                       ai_url=self.ai_url.text().strip() or DEFAULTS["ai_url"],
+                       ai_model=self.ai_model.text().strip() or DEFAULTS["ai_model"])
         save_settings(self.st)
         self.refresh_accounts()
 
@@ -1787,6 +1930,27 @@ class Main(QtWidgets.QMainWindow):
             self.bus.accounts.emit()
         self.run_bg("Вход во ВК", fn)
 
+    def do_ai_check(self) -> None:
+        def fn():
+            ok, msg = ai_status(self.st)
+            self.bus.log.emit(f"ИИ: {msg}")
+            if ok:
+                it = {"source": "youtube", "id": "x", "url": "", "author": "test",
+                      "title": "Подшутил над другом: подменил сахар солью 😂", "desc": "#пранк",
+                      "duration": 25}
+                t = time.time()
+                score, why = ai_score(self.st, it, "пранки над друзьями", False)
+                self.bus.log.emit(f"ИИ: пробная оценка {score} — {why} "
+                                  f"({time.time() - t:.0f} с, дальше будет быстрее)")
+        self.run_bg("Проверка ИИ", fn)
+
+    def do_ai_pull(self) -> None:
+        def fn():
+            self.bus.log.emit(f"Скачиваю модель {self.st['ai_model']} — это несколько минут…")
+            ai_pull(self.st, self.bus.log.emit)
+            self.bus.log.emit("Модель скачана. Нажми «Проверить ИИ».")
+        self.run_bg("Скачивание модели", fn)
+
     def do_yt_connect(self) -> None:
         if not self.st["yt_client_secret"] or not Path(self.st["yt_client_secret"]).is_file():
             path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1825,7 +1989,9 @@ class Main(QtWidgets.QMainWindow):
                 "junk": word_list(self.st.get("junk_words", "")) if self.no_junk.isChecked() else [],
                 "min_views": self.min_views.value(), "period": PERIODS[self.period.currentIndex()][1],
                 "lang": LANGS[self.lang.currentIndex()][1], "sort": SORTS[self.sort.currentIndex()][1],
-                "hide_posted": self.hide_posted.isChecked()}
+                "hide_posted": self.hide_posted.isChecked(),
+                "ai": self.use_ai.isChecked(), "ai_min": self.ai_min.value(),
+                "ai_desc": self.ai_desc.toPlainText().strip(), "ai_image": self.ai_image.isChecked()}
 
     def get_form(self) -> dict:
         return {"sources": [k for k, cb in self.src_boxes.items() if cb.isChecked()],
@@ -1834,7 +2000,9 @@ class Main(QtWidgets.QMainWindow):
                 "period": self.period.currentIndex(), "lang": self.lang.currentIndex(),
                 "sort": self.sort.currentIndex(), "short": self.only_short.isChecked(),
                 "strict": self.strict.isChecked(), "no_junk": self.no_junk.isChecked(),
-                "hide_posted": self.hide_posted.isChecked()}
+                "hide_posted": self.hide_posted.isChecked(),
+                "ai": self.use_ai.isChecked(), "ai_min": self.ai_min.value(),
+                "ai_desc": self.ai_desc.toPlainText(), "ai_image": self.ai_image.isChecked()}
 
     def set_form(self, f: dict) -> None:
         for k, cb in self.src_boxes.items():
@@ -1849,6 +2017,10 @@ class Main(QtWidgets.QMainWindow):
         self.strict.setChecked(f.get("strict", True))
         self.no_junk.setChecked(f.get("no_junk", True))
         self.hide_posted.setChecked(f.get("hide_posted", True))
+        self.use_ai.setChecked(f.get("ai", False))
+        self.ai_min.setValue(int(f.get("ai_min", 6)))
+        self.ai_desc.setPlainText(f.get("ai_desc", ""))
+        self.ai_image.setChecked(f.get("ai_image", False))
 
     def refresh_themes(self, current: str = "") -> None:
         self.theme_box.clear()
@@ -1920,12 +2092,67 @@ class Main(QtWidgets.QMainWindow):
                             f"или повторы)")
                 self.bus.log.emit(f"{name}: найдено {len(items)}{note}")
                 found += items
+            if f.get("ai") and found:
+                found = self.ai_rate(found, f)
             if f.get("sort") == "views":
                 found.sort(key=lambda i: i.get("views") or -1, reverse=True)
             elif f.get("sort") == "date":
                 found.sort(key=lambda i: i.get("date") or 0, reverse=True)
             (self.bus.more if mode == "more" else self.bus.results).emit(found)
         self.run_bg("Поиск", fn)
+
+    def ai_rate(self, items: list, f: dict, drop: bool = True) -> list:
+        """Оценивает ролики ИИ (в фоне). drop — убрать те, что ниже порога."""
+        if not f.get("ai_desc"):
+            self.bus.log.emit("ИИ: заполни поле «Что нужно — своими словами», без него ИИ не "
+                              "понимает, что искать. Показываю без отбора.")
+            return items
+        ready, msg = ai_status(self.st)
+        if not ready:
+            self.bus.log.emit(f"ИИ: {msg} Показываю без отбора.")
+            return items
+        self.bus.log.emit(f"ИИ проверяет {len(items)} роликов — первый может занять минуту, "
+                          "пока модель загружается…")
+        t0, done = time.time(), 0
+        for n, it in enumerate(items, 1):
+            if it.get("ai") is not None and it.get("ai_theme") == f["ai_desc"]:
+                continue
+            try:
+                it["ai"], it["ai_reason"] = ai_score(self.st, it, f["ai_desc"],
+                                                     f.get("ai_image", False))
+                it["ai_theme"] = f["ai_desc"]
+                done += 1
+                self.bus.log.emit(f"ИИ {n}/{len(items)}: {it['ai']} — {it['ai_reason']} "
+                                  f"· {(it.get('title') or '')[:40]}")
+            except Exception as e:
+                self.bus.log.emit(f"ИИ {n}/{len(items)}: ошибка — {str(e)[:120]}")
+        if done:
+            self.bus.log.emit(f"ИИ: готово за {int(time.time() - t0)} с.")
+        items = sorted(items, key=lambda i: i.get("ai") if i.get("ai") is not None else -1,
+                       reverse=True)
+        if drop:
+            kept = [i for i in items if i.get("ai") is None or i["ai"] >= f.get("ai_min", 0)]
+            self.bus.log.emit(f"ИИ оставил {len(kept)} из {len(items)} "
+                              f"(оценка от {f.get('ai_min', 0)}).")
+            return kept
+        return items
+
+    def rate_list(self) -> None:
+        if not self.items:
+            self.log("Список пуст.")
+            return
+        f = self.form_filters()
+        items = list(self.items)
+
+        def fn():
+            rated = self.ai_rate(items, f, drop=False)
+            self.bus.rerank.emit(rated)
+        self.run_bg("ИИ", fn)
+
+    def on_rerank(self, rated: list) -> None:
+        marks = {f"{it['source']}:{it['id']}" for r, it in enumerate(self.items)
+                 if self.table.item(r, 0).checkState() == QtCore.Qt.Checked}
+        self.show_results(rated, marks)
 
     def start_search(self) -> None:
         queries = [q.strip() for q in self.query.toPlainText().splitlines() if q.strip()]
@@ -2033,9 +2260,13 @@ class Main(QtWidgets.QMainWindow):
                 title = f"{title} · {it['desc'].strip()[:200]}"
             cells = [SOURCE_NAMES[it["source"]], it["author"], title.replace("\n", " "),
                      fmt_dur(it["duration"]), fmt_num(it["views"]), fmt_ago(it.get("date")),
+                     str(it["ai"]) if it.get("ai") is not None else "",
                      "уже заливалось" if done else ""]
             for c, text in enumerate(cells, start=1):
-                self.table.setItem(r, c, QtWidgets.QTableWidgetItem(text))
+                cell = QtWidgets.QTableWidgetItem(text)
+                if c == 7 and it.get("ai_reason"):
+                    cell.setToolTip(it["ai_reason"])
+                self.table.setItem(r, c, cell)
         self.log(f"Всего в списке: {len(items)}")
 
     def add_items_unmarked(self, new: list) -> None:
@@ -2052,7 +2283,7 @@ class Main(QtWidgets.QMainWindow):
     def set_row_status(self, key: str, text: str) -> None:
         for r, it in enumerate(self.items):
             if f"{it['source']}:{it['id']}" == key:
-                self.table.item(r, 7).setText(text)
+                self.table.item(r, 8).setText(text)
 
     # ---------- заливка
     def start_upload(self) -> None:
